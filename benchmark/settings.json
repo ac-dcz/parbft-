@@ -1,0 +1,26 @@
+{
+    "key": {
+        "name": "dcz",
+        "path": "/home/yucz/.ssh/id_rsa"
+    },
+    "ports": {
+        "smvba": 9000,
+        "consensus": 8000,
+        "mempool": 7000,
+        "front": 6000
+    },
+    "repo": {
+        "name": "parbft-bvaba",
+        "url": "https://github.com/ac-dcz/parbft-bvaba",
+        "branch": "main"
+    },
+    "instances": {
+        "type": "m5d.2xlarge",
+        "regions": [
+            "us-east-1",
+            "eu-north-1",
+            "ap-northeast-1",
+            "ap-southeast-2"
+        ]
+    }
+}
