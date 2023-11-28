@@ -180,30 +180,144 @@ impl fmt::Display for HVote {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub enum PrePareProof {
+    OPT(QC),
+    PES(SPBProof),
+}
+
+impl PrePareProof {
+    pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
+        match self {
+            Self::OPT(qc) => qc.verify(committee),
+            Self::PES(proof) => {
+                ensure!(proof.phase == FIN_PHASE, ConsensusError::InvalidFinProof());
+                proof.verify(committee)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PrePare {
+    pub author: PublicKey,
+    pub epoch: SeqNumber,
+    pub height: SeqNumber,
+    pub val: u8,
+    pub proof: PrePareProof,
+    pub signature: Signature,
+}
+
+impl PrePare {
+    pub async fn new(
+        author: PublicKey,
+        epoch: SeqNumber,
+        height: SeqNumber,
+        proof: PrePareProof,
+        val: u8,
+        mut signature_service: SignatureService,
+    ) -> Self {
+        let mut prepare = Self {
+            author,
+            epoch,
+            height,
+            val,
+            proof,
+            signature: Signature::default(),
+        };
+
+        prepare.signature = signature_service.request_signature(prepare.digest()).await;
+
+        return prepare;
+    }
+
+    pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
+        ensure!(
+            self.val == OPT || self.val == PES,
+            ConsensusError::InvalidPrePareTag(self.val)
+        );
+
+        self.signature.verify(&self.digest(), &self.author)?;
+
+        self.proof.verify(committee)
+    }
+}
+
+impl Hash for PrePare {
+    fn digest(&self) -> Digest {
+        let mut hasher = Sha512::new();
+        hasher.update(self.val.to_le_bytes());
+        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+    }
+}
+
+impl fmt::Debug for PrePare {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut tag = String::from("Unkonw");
+        if self.tag == OPT {
+            tag = "OPT".to_string();
+        } else if self.tag == PES {
+            tag = "PES".to_string();
+        }
+        write!(f, "PrePare(tag {}, block {:?})", tag, self.block)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SPBValue {
+    pub val: u8,                                 //ABA输入
+    pub signatures: Vec<(PublicKey, Signature)>, // 签名验证 0->f+1  1->2f+1
     pub block: Block,
     pub round: SeqNumber,
     pub phase: u8,
 }
 
 impl SPBValue {
-    pub async fn new(block: Block, round: SeqNumber, phase: u8) -> Self {
+    pub async fn new(
+        block: Block,
+        round: SeqNumber,
+        phase: u8,
+        val: u8,
+        sigantures: Vec<(PublicKey, Signature)>,
+    ) -> Self {
         Self {
             block,
             round,
             phase,
+            val,
+            signatures,
         }
     }
 
-    pub fn verify(
-        &self,
-        committee: &Committee,
-        proof: &SPBProof,
-        pk_set: &PublicKeySet,
-    ) -> ConsensusResult<()> {
+    pub fn aba_val_digest(val: u8) -> Digest {
+        let mut hasher = Sha512::new();
+        hasher.update(self.val.to_le_bytes());
+        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+    }
+
+    pub fn verify(&self, committee: &Committee, proof: &SPBProof) -> ConsensusResult<()> {
+        let mut flag = true;
+
+        if self.val == OPT && self.signatures.len() < committee.random_coin_threshold() {
+            flag = false;
+        } else if self.val == PES && self.signatures.len() < committee.quorum_threshold() {
+            flag = false;
+        } else {
+            flag = false;
+        }
+
+        if flag {
+            // Check the signatures.
+            Signature::verify_batch(&SPBValue::aba_val_digest(self.val), &self.signatures)
+                .map_err(ConsensusError::from)
+        } else {
+            return Err(ConsensusError::InvalidPrepareTag(self.val));
+        }
+
         self.block.verify(committee)?;
-        proof.verify(committee, pk_set)?;
+
+        proof.verify(committee)?;
+
         Ok(())
     }
 }
@@ -261,13 +375,13 @@ impl SPBVote {
     }
 
     //验证门限签名是否正确
-    pub fn verify(&self, committee: &Committee, _pk_set: &PublicKeySet) -> ConsensusResult<()> {
+    pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
         // Ensure the authority has voting rights.
         ensure!(
             committee.stake(&self.author) > 0,
             ConsensusError::UnknownAuthority(self.author)
         );
-        // self.signature.verify(&self.digest(), &self.author)?;
+        self.signature.verify(&self.digest(), &self.author)?;
         // let tss_pk = pk_set.public_key_share(committee.id(self.author));
         // // Check the signature.
         // ensure!(
@@ -307,7 +421,7 @@ pub struct SPBProof {
 }
 
 impl SPBProof {
-    pub fn verify(&self, committee: &Committee, pk_set: &PublicKeySet) -> ConsensusResult<()> {
+    pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
         if self.phase <= INIT_PHASE {
             //第一阶段不做检查
             return Ok(());
@@ -328,7 +442,7 @@ impl SPBProof {
             );
 
             for share in &self.shares {
-                share.verify(committee, pk_set)?;
+                share.verify(committee)?;
             }
         }
 
@@ -353,21 +467,23 @@ impl fmt::Display for SPBProof {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub struct MDone {
+pub struct MDoneAndShare {
     pub author: PublicKey,
     pub signature: Signature,
     pub epoch: SeqNumber,
     pub height: SeqNumber,
     pub round: SeqNumber,
+    pub share: RandomnessShare,
 }
 
-impl MDone {
+impl MDoneAndShare {
     pub async fn new(
         author: PublicKey,
         mut signature_service: SignatureService,
         epoch: SeqNumber,
         height: SeqNumber,
         round: SeqNumber,
+        share: RandomnessShare,
     ) -> Self {
         let mut done = Self {
             author,
@@ -375,18 +491,20 @@ impl MDone {
             epoch,
             height,
             round,
+            share,
         };
         done.signature = signature_service.request_signature(done.digest()).await;
         return done;
     }
 
-    pub fn verify(&self) -> ConsensusResult<()> {
-        // self.signature.verify(&self.digest(), &self.author)?;
+    pub fn verify(&self, committee: &Committee, pk_set: &PublicKeySet) -> ConsensusResult<()> {
+        self.signature.verify(&self.digest(), &self.author)?;
+        self.share.verify(committee, pk_set)?;
         Ok(())
     }
 }
 
-impl Hash for MDone {
+impl Hash for MDoneAndShare {
     fn digest(&self) -> Digest {
         let mut hasher = Sha512::new();
         hasher.update(self.author.0);
@@ -397,15 +515,16 @@ impl Hash for MDone {
     }
 }
 
-impl fmt::Debug for MDone {
+impl fmt::Debug for MDoneAndShare {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
-            "Done(author {},height {},epoch {},round {},)",
+            "Done(author {},height {},epoch {},round {})",
             self.author, self.height, self.epoch, self.round
         )
     }
 }
+
 #[derive(Clone, Serialize, Deserialize)]
 pub enum PreVoteTag {
     Yes(SPBValue, SPBProof),
@@ -422,47 +541,10 @@ impl PreVoteTag {
         Self::No()
     }
 
-    // async fn new_no(
-    //     leader: PublicKey,
-    //     round: SeqNumber,
-    //     height: SeqNumber,
-    //     epoch: SeqNumber,
-    //     mut signature_service: SignatureService,
-    // ) -> SMVBAVoteTag {
-    //     let share = signature_service
-    //         .request_tss_signature(Self::digest_no(leader, round, height, epoch))
-    //         .await
-    //         .unwrap();
-    //     Self::No(share)
-    // }
-
-    // fn digest_no(
-    //     leader: PublicKey,
-    //     round: SeqNumber,
-    //     height: SeqNumber,
-    //     epoch: SeqNumber,
-    // ) -> Digest {
-    //     let mut hasher = Sha512::new();
-    //     hasher.update(leader.0);
-    //     hasher.update("no-null");
-    //     hasher.update(round.to_be_bytes());
-    //     hasher.update(height.to_le_bytes());
-    //     hasher.update(epoch.to_le_bytes());
-    //     Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
-    // }
-
-    pub fn verify(&self, committee: &Committee, pk_set: &PublicKeySet) -> ConsensusResult<()> {
+    pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
         match self {
-            Self::Yes(v, p) => v.verify(committee, p, pk_set),
-            Self::No() => {
-                // let tss_pk = pk_set.public_key_share(committee.id(name));
-                // // Check the signature.
-                // ensure!(
-                //     tss_pk.verify(share, d),
-                //     ConsensusError::InvalidThresholdSignature(name)
-                // );
-                Ok(())
-            }
+            Self::Yes(v, p) => v.verify(committee, p),
+            Self::No() => Ok(()),
         }
     }
 
@@ -526,7 +608,7 @@ impl MPreVote {
         return pvote;
     }
 
-    pub fn verify(&self, committee: &Committee, pk_set: &PublicKeySet) -> ConsensusResult<()> {
+    pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
         // Ensure the authority has voting rights.
         let voting_rights = committee.stake(&self.author);
         ensure!(
@@ -537,7 +619,7 @@ impl MPreVote {
         self.signature.verify(&self.digest(), &self.author)?;
 
         //chekc tag
-        self.tag.verify(committee, pk_set)?;
+        self.tag.verify(committee)?;
 
         Ok(())
     }
@@ -572,7 +654,6 @@ impl fmt::Debug for MPreVote {
 #[derive(Clone, Serialize, Deserialize)]
 pub enum MVoteTag {
     Yes(SPBValue, SPBProof, SPBVote),
-    // No(Vec<MPreVote>, SignatureShare),
     No(),
 }
 
@@ -591,11 +672,11 @@ impl MVoteTag {
         Self::No()
     }
 
-    pub fn verify(&self, committee: &Committee, pk_set: &PublicKeySet) -> ConsensusResult<()> {
+    pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
         match self {
             Self::Yes(value, proof, prevote) => {
-                value.verify(committee, proof, pk_set)?;
-                prevote.verify(committee, pk_set)?;
+                value.verify(committee, proof)?;
+                prevote.verify(committee)?;
                 Ok(())
             }
             Self::No() => Ok(()),
@@ -674,7 +755,7 @@ impl MVote {
         self.signature.verify(&self.digest(), &self.author)?;
 
         //chekc tag
-        self.tag.verify(committee, pk_set)?;
+        self.tag.verify(committee)?;
 
         Ok(())
     }
@@ -752,7 +833,7 @@ impl MHalt {
             self.proof.phase == FIN_PHASE, //是否为finsh phase 阶段
             ConsensusError::InvalidFinProof()
         );
-        self.value.verify(committee, &self.proof, pk_set)?;
+        self.value.verify(committee, &self.proof)?;
 
         Ok(())
     }
@@ -775,203 +856,6 @@ impl fmt::Debug for MHalt {
             f,
             "MHalt(author {}, round {}, leader {},)",
             self.author, self.round, self.leader
-        )
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub enum PrePareProof {
-    OPT(QC),
-    PES(SPBProof),
-}
-
-impl PrePareProof {
-    pub fn verify(&self, committee: &Committee, pk_set: &PublicKeySet) -> ConsensusResult<()> {
-        match self {
-            Self::OPT(qc) => qc.verify(committee),
-            Self::PES(proof) => {
-                ensure!(proof.phase == FIN_PHASE, ConsensusError::InvalidFinProof());
-                proof.verify(committee, pk_set)
-            }
-        }
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct PrePare {
-    pub author: PublicKey,
-    pub epoch: SeqNumber,
-    pub height: SeqNumber,
-    pub tag: u8,
-    pub block: Block,
-    pub proof: PrePareProof,
-    pub signature: Signature,
-}
-
-impl PrePare {
-    pub async fn new(
-        author: PublicKey,
-        block: Block,
-        proof: PrePareProof,
-        tag: u8,
-        mut signature_service: SignatureService,
-    ) -> Self {
-        let mut prepare = Self {
-            author,
-            epoch: block.epoch,
-            height: block.height,
-            tag,
-            block,
-            proof,
-            signature: Signature::default(),
-        };
-        prepare.signature = signature_service.request_signature(prepare.digest()).await;
-        return prepare;
-    }
-    pub fn verify(&self, committee: &Committee, pk_set: &PublicKeySet) -> ConsensusResult<()> {
-        self.signature.verify(&self.digest(), &self.author)?;
-
-        self.proof.verify(committee, pk_set)
-    }
-}
-
-impl Hash for PrePare {
-    fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(self.author.0);
-        hasher.update(self.height.to_le_bytes());
-        hasher.update(self.epoch.to_le_bytes());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
-    }
-}
-
-impl fmt::Debug for PrePare {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut tag = String::from("Unkonw");
-        if self.tag == OPT {
-            tag = "OPT".to_string();
-        } else if self.tag == PES {
-            tag = "PES".to_string();
-        }
-        write!(f, "PrePare(tag {}, block {:?})", tag, self.block)
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ABAVal {
-    pub author: PublicKey,
-    pub epoch: SeqNumber,
-    pub height: SeqNumber,
-    pub round: SeqNumber,
-    pub phase: u8,
-    pub val: usize,
-    pub signature: Signature,
-}
-
-impl ABAVal {
-    pub async fn new(
-        author: PublicKey,
-        epoch: SeqNumber,
-        height: SeqNumber,
-        round: SeqNumber,
-        val: usize,
-        phase: u8,
-        mut signature_service: SignatureService,
-    ) -> Self {
-        let mut aba_val = Self {
-            author,
-            epoch,
-            height,
-            round,
-            val,
-            phase,
-            signature: Signature::default(),
-        };
-        aba_val.signature = signature_service.request_signature(aba_val.digest()).await;
-        return aba_val;
-    }
-
-    pub fn verify(&self) -> ConsensusResult<()> {
-        self.signature.verify(&self.digest(), &self.author)?;
-        Ok(())
-    }
-}
-
-impl Hash for ABAVal {
-    fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(self.author.0);
-        hasher.update(self.height.to_le_bytes());
-        hasher.update(self.epoch.to_le_bytes());
-        hasher.update(self.round.to_le_bytes());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
-    }
-}
-
-impl fmt::Debug for ABAVal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "ABAVal(round {},phase {},val {})",
-            self.round, self.phase, self.val
-        )
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct ABAOutput {
-    pub author: PublicKey,
-    pub epoch: SeqNumber,
-    pub height: SeqNumber,
-    pub round: SeqNumber,
-    pub val: usize,
-    pub signature: Signature,
-}
-
-impl ABAOutput {
-    pub async fn new(
-        author: PublicKey,
-        epoch: SeqNumber,
-        height: SeqNumber,
-        round: SeqNumber,
-        val: usize,
-        mut signature_service: SignatureService,
-    ) -> Self {
-        let mut out = Self {
-            author,
-            epoch,
-            height,
-            round,
-            val,
-            signature: Signature::default(),
-        };
-        out.signature = signature_service.request_signature(out.digest()).await;
-        return out;
-    }
-
-    pub fn verify(&self) -> ConsensusResult<()> {
-        self.signature.verify(&self.digest(), &self.author)?;
-        Ok(())
-    }
-}
-
-impl Hash for ABAOutput {
-    fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(self.author.0);
-        hasher.update(self.epoch.to_le_bytes());
-        hasher.update(self.height.to_le_bytes());
-        hasher.update(self.round.to_le_bytes());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
-    }
-}
-
-impl fmt::Debug for ABAOutput {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "ABAOutput(author {},height {},round {},val {})",
-            self.author, self.height, self.round, self.val
         )
     }
 }

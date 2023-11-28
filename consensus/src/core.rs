@@ -5,13 +5,13 @@ use crate::filter::FilterInput;
 use crate::leader::LeaderElector;
 use crate::mempool::MempoolDriver;
 use crate::messages::{
-    ABAOutput, ABAVal, Block, HVote, MDone, MHalt, MPreVote, MVote, MVoteTag, PrePare,
-    PrePareProof, PreVoteTag, RandomnessShare, SPBProof, SPBValue, SPBVote, QC,
+    Block, HVote, MDoneAndShare, MHalt, MPreVote, MVote, MVoteTag, PrePare, PrePareProof,
+    PreVoteTag, RandomnessShare, SPBProof, SPBValue, SPBVote, QC,
 };
 use crate::synchronizer::Synchronizer;
 use async_recursion::async_recursion;
-use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
+use crypto::{Hash as _, Signature};
 use futures::sink::Fanout;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -51,15 +51,12 @@ pub enum ConsensusMessage {
     SPBPropose(SPBValue, SPBProof),
     SPBVote(SPBVote),
     SPBFinsh(SPBValue, SPBProof),
-    SPBDone(MDone),
+    SPBDoneAndShare(MDoneAndShare),
     SMVBAPreVote(MPreVote),
     SMVBAVote(MVote),
     SMVBACoinShare(RandomnessShare), //elect leader
     SMVBAHalt(MHalt),                //mvba halt
     ParPrePare(PrePare),
-    ParABAVal(ABAVal),
-    ParABACoinShare(RandomnessShare),
-    ParABAOutput(ABAOutput),
     ParLoopBack(Block),
 }
 
@@ -96,25 +93,15 @@ pub struct Core {
     spb_finishs: HashMap<(SeqNumber, SeqNumber), HashMap<PublicKey, (SPBValue, SPBProof)>>,
     spb_locks: HashMap<(SeqNumber, SeqNumber), HashMap<PublicKey, (SPBValue, SPBProof)>>,
     spb_current_phase: HashMap<(SeqNumber, SeqNumber), u8>,
-    spb_abandon_flag: HashMap<(SeqNumber, SeqNumber), bool>,
-    smvba_halt_falg: HashMap<(SeqNumber, SeqNumber), bool>,
+    spb_abandon_flag: HashMap<SeqNumber, bool>,
+    smvba_halt_falg: HashMap<SeqNumber, bool>,
     smvba_dones: HashMap<(SeqNumber, SeqNumber), HashSet<PublicKey>>,
     smvba_current_round: HashMap<SeqNumber, SeqNumber>, // height->round
-    // smvba_yes_votes: HashMap<(SeqNumber, SeqNumber), Vec<MVote>>,
-    smvba_votes: HashMap<(SeqNumber, SeqNumber), HashSet<PublicKey>>,
+    smvba_votes: HashMap<(SeqNumber, SeqNumber), HashSet<PublicKey>>, // 记录所有的投票数量
     smvba_no_prevotes: HashMap<(SeqNumber, SeqNumber), HashSet<PublicKey>>,
-    prepare_tag: HashSet<SeqNumber>, //标记 height高度的 tag是否已经发送
-    par_prepare_opts: HashMap<SeqNumber, HashSet<PublicKey>>,
-    par_prepare_pess: HashMap<SeqNumber, HashSet<PublicKey>>,
-    par_values: HashMap<SeqNumber, [Option<Block>; 2]>,
-    aba_vals_used: HashMap<(SeqNumber, SeqNumber, u8), HashSet<PublicKey>>,
-    aba_temp_vals: HashMap<(SeqNumber, SeqNumber, u8), [Stake; 2]>,
-    aba_bin_vals: HashMap<(SeqNumber, SeqNumber), [bool; 2]>,
-    aba_mux_vals: HashMap<(SeqNumber, SeqNumber), [bool; 2]>,
-    aba_current_round: HashMap<SeqNumber, SeqNumber>,
-    aba_output: HashMap<SeqNumber, Option<usize>>,
-    aba_output_messages: HashMap<SeqNumber, HashSet<PublicKey>>,
-    par_value_wait: HashMap<SeqNumber, [bool; 2]>,
+    prepare_tag: HashMap<SeqNumber, PrePare>, //标记 height高度的 val是否已经发送
+    par_prepare_opts: HashMap<SeqNumber, HashMap<PublicKey, Signature>>,
+    par_prepare_pess: HashMap<SeqNumber, HashMap<PublicKey, Signature>>,
 }
 impl Core {
     #[allow(clippy::too_many_arguments)]
@@ -176,24 +163,14 @@ impl Core {
             smvba_halt_falg: HashMap::new(),
             smvba_current_round: HashMap::new(),
             smvba_dones: HashMap::new(),
-            // smvba_yes_votes: HashMap::new(),
             smvba_votes: HashMap::new(),
             smvba_no_prevotes: HashMap::new(),
-            prepare_tag: HashSet::new(),
+            prepare_tag: HashMap::new(),
             par_prepare_opts: HashMap::new(),
             par_prepare_pess: HashMap::new(),
-            par_values: HashMap::new(),
-            aba_vals_used: HashMap::new(),
-            aba_temp_vals: HashMap::new(),
-            aba_current_round: HashMap::new(),
-            aba_output: HashMap::new(),
-            aba_bin_vals: HashMap::new(),
-            aba_mux_vals: HashMap::new(),
-            aba_output_messages: HashMap::new(),
-            par_value_wait: HashMap::new(),
         };
         core.update_smvba_state(1, 1);
-        core.update_hs_state(1);
+        core.update_prepare_state(1);
         return core;
     }
 
@@ -207,41 +184,32 @@ impl Core {
         self.high_qc = QC::genesis();
         self.last_voted_height = 0;
         self.last_committed_height = 0;
-        self.spb_proposes = HashMap::new();
-        self.spb_finishs = HashMap::new();
-        self.smvba_current_round = HashMap::new();
-        // self.smvba_yes_votes = HashMap::new();
-        self.smvba_votes = HashMap::new();
-        self.smvba_no_prevotes = HashMap::new();
-        self.prepare_tag = HashSet::new();
-        self.smvba_y_flag = HashMap::new();
-        self.smvba_n_flag = HashMap::new();
-        self.smvba_d_flag = HashMap::new();
-        self.spb_current_phase = HashMap::new();
-        self.smvba_dones = HashMap::new();
-        self.par_prepare_opts = HashMap::new();
-        self.par_prepare_pess = HashMap::new();
-        self.par_values = HashMap::new();
-        self.aba_vals_used = HashMap::new();
-        self.aba_temp_vals = HashMap::new();
-        self.aba_current_round = HashMap::new();
-        self.aba_output = HashMap::new();
-        self.aba_bin_vals = HashMap::new();
-        self.aba_mux_vals = HashMap::new();
-        self.aba_output_messages = HashMap::new();
-        self.par_value_wait = HashMap::new();
-        self.spb_abandon_flag = HashMap::new();
-        self.smvba_halt_falg = HashMap::new();
+        self.smvba_y_flag.clear();
+        self.smvba_n_flag.clear();
+        self.smvba_d_flag.clear();
+        self.spb_proposes.clear();
+        self.spb_finishs.clear();
+        self.spb_locks.clear();
+        self.spb_current_phase.clear();
+        self.spb_abandon_flag.clear();
+        self.smvba_halt_falg.clear();
+        self.smvba_current_round.clear();
+        self.smvba_dones.clear();
+        self.smvba_votes.clear();
+        self.smvba_no_prevotes.clear();
+        self.prepare_tag.clear();
+        self.par_prepare_opts.clear();
+        self.par_prepare_pess.clear();
         self.update_smvba_state(1, 1);
-        self.update_hs_state(1);
+        self.update_prepare_state(1);
     }
 
     fn update_smvba_state(&mut self, height: SeqNumber, round: SeqNumber) {
         //每人都从第一轮开始
-        self.smvba_current_round.insert(height, round);
         self.smvba_d_flag.insert((height, round), false);
         self.smvba_y_flag.insert((height, round), false);
         self.smvba_n_flag.insert((height, round), false);
+        self.smvba_current_round.insert(height, round);
         self.spb_current_phase.insert((height, round), INIT_PHASE);
         self.smvba_dones.insert((height, round), HashSet::new());
         self.smvba_no_prevotes
@@ -249,41 +217,28 @@ impl Core {
         self.smvba_votes.insert((height, round), HashSet::new());
     }
 
-    fn update_hs_state(&mut self, height: SeqNumber) {
-        self.par_prepare_opts.insert(height, HashSet::new());
-        self.par_prepare_pess.insert(height, HashSet::new());
-        self.aba_current_round.insert(height, 1);
-        self.aba_output.insert(height, None);
-        self.aba_bin_vals.insert((height, 1), [false, false]);
-        self.aba_mux_vals.insert((height, 1), [false, false]);
-        self.aba_current_round.insert(height, 1);
-        self.aba_output.insert(height, None);
-        self.aba_output_messages.insert(height, HashSet::new());
-        self.par_value_wait.insert(height, [false, false]);
+    fn update_prepare_state(&mut self, height: SeqNumber) {
+        self.par_prepare_opts.insert(height, HashMap::new());
+        self.par_prepare_pess.insert(height, HashMap::new());
     }
 
     fn clean_smvba_state(&mut self, height: &SeqNumber) {
+        self.smvba_d_flag.retain(|(h, _), _| h > height);
+        self.smvba_y_flag.retain(|(h, _), _| h > height);
+        self.smvba_n_flag.retain(|(h, _), _| h > height);
+        self.spb_current_phase.retain(|(h, _), _| h > height);
         self.smvba_current_round.retain(|h, _| h > height);
         self.spb_proposes.retain(|(h, _), _| h > height);
         self.spb_finishs.retain(|(h, _), _| h > height);
         self.spb_locks.retain(|(h, _), _| h > height);
-        // self.smvba_yes_votes.retain(|(h, _), _| h >= height);
+        self.smvba_dones.retain(|(h, _), _| h > height);
         self.smvba_votes.retain(|(h, _), _| h > height);
         self.smvba_no_prevotes.retain(|(h, _), _| h > height);
         self.aggregator.cleanup_mvba_random(height);
         self.aggregator.cleanup_spb_vote(height);
-
-        //
+        self.prepare_tag.retain(|h, _| h > height);
         self.par_prepare_opts.retain(|h, _| h > height);
         self.par_prepare_pess.retain(|h, _| h > height);
-        self.aba_current_round.retain(|h, _| h > height);
-        self.aba_output.retain(|h, _| h > height);
-        self.aba_bin_vals.retain(|(h, _), _| h > height);
-        self.aba_mux_vals.retain(|(h, _), _| h > height);
-        self.aba_current_round.retain(|h, _| h > height);
-        self.aba_output.retain(|h, _| h > height);
-        self.aba_output_messages.retain(|h, _| h > height);
-        self.par_value_wait.retain(|h, _| h > height);
     }
 
     async fn store_block(&mut self, block: &Block) {
@@ -417,7 +372,7 @@ impl Core {
         // Reset the timer and advance round.
         self.height = height + 1;
         debug!("Moved to round {}", self.height);
-        self.update_hs_state(self.height);
+        self.update_prepare_state(self.height);
     }
     // -- End Pacemaker --
 
@@ -481,28 +436,28 @@ impl Core {
         block: Block,
         proof: SPBProof,
     ) -> ConsensusResult<()> {
-        let value = SPBValue::new(block, proof.round, proof.phase).await;
+        // let value = SPBValue::new(block, proof.round, proof.phase).await;
 
-        if proof.phase == INIT_PHASE {
-            self.spb_proposes
-                .insert((value.block.height, value.round), value.clone());
-        }
+        // if proof.phase == INIT_PHASE {
+        //     self.spb_proposes
+        //         .insert((value.block.height, value.round), value.clone());
+        // }
 
-        let message = ConsensusMessage::SPBPropose(value.clone(), proof.clone());
-        Synchronizer::transmit(
-            message,
-            &self.name,
-            None,
-            &self.network_filter_smvba,
-            &self.committee,
-            PES,
-        )
-        .await?;
-        self.process_spb_propose(&value, &proof).await?;
-        // Wait for the minimum block delay.
-        if self.parameters.ddos {
-            sleep(Duration::from_millis(self.parameters.min_block_delay)).await;
-        }
+        // let message = ConsensusMessage::SPBPropose(value.clone(), proof.clone());
+        // Synchronizer::transmit(
+        //     message,
+        //     &self.name,
+        //     None,
+        //     &self.network_filter_smvba,
+        //     &self.committee,
+        //     PES,
+        // )
+        // .await?;
+        // self.process_spb_propose(&value, &proof).await?;
+        // // Wait for the minimum block delay.
+        // if self.parameters.ddos {
+        //     sleep(Duration::from_millis(self.parameters.min_block_delay)).await;
+        // }
         Ok(())
     }
 
@@ -677,38 +632,47 @@ impl Core {
         proof: PrePareProof,
         path: u8,
     ) -> ConsensusResult<()> {
-        if self.prepare_tag.contains(&height) {
-            return Ok(());
-        }
-        self.prepare_tag.insert(height);
+        // if self.prepare_tag.contains(&height) {
+        //     return Ok(());
+        // }
+        // self.prepare_tag.insert(height);
 
-        let prepare = PrePare::new(
-            self.name,
-            block.clone(),
-            proof,
-            path,
-            self.signature_service.clone(),
-        )
-        .await;
+        // let prepare = PrePare::new(
+        //     self.name,
+        //     block.clone(),
+        //     proof,
+        //     path,
+        //     self.signature_service.clone(),
+        // )
+        // .await;
 
-        self.handle_par_prepare(prepare.clone()).await?;
+        // self.handle_par_prepare(prepare.clone()).await?;
 
-        let message = ConsensusMessage::ParPrePare(prepare);
-        Synchronizer::transmit(
-            message,
-            &self.name,
-            None,
-            &self.network_filter_smvba,
-            &self.committee,
-            PES,
-        )
-        .await?;
+        // let message = ConsensusMessage::ParPrePare(prepare);
+        // Synchronizer::transmit(
+        //     message,
+        //     &self.name,
+        //     None,
+        //     &self.network_filter_smvba,
+        //     &self.committee,
+        //     PES,
+        // )
+        // .await?;
         Ok(())
     }
 
     async fn terminate_smvba(&mut self, height: SeqNumber) -> ConsensusResult<()> {
         self.clean_smvba_state(&height);
         Ok(())
+    }
+
+    //启动smvba
+    async fn invoke_smvba(
+        &mut self,
+        epoch: SeqNumber,
+        height: SeqNumber,
+        tag: u8,
+    ) -> ConsensusResult<()> {
     }
 
     async fn handle_sync_request(
@@ -751,11 +715,53 @@ impl Core {
         }
 
         // halt?
-        if *self.smvba_halt_falg.entry((height, round)).or_insert(false) {
+        if *self.smvba_halt_falg.entry(height).or_insert(false) {
             return false;
         }
 
         true
+    }
+
+    async fn handle_par_prepare(&mut self, prepare: PrePare) -> ConsensusResult<()> {
+        ensure!(
+            prepare.epoch == self.epoch && prepare.height + 2 > self.height,
+            ConsensusError::TimeOutMessage(prepare.epoch, prepare.height)
+        );
+
+        prepare.verify(&self.committee)?;
+
+        let opt_set = self
+            .par_prepare_opts
+            .entry(prepare.height)
+            .or_insert(HashMap::new());
+        let pes_set = self
+            .par_prepare_pess
+            .entry(prepare.height)
+            .or_insert(HashMap::new());
+
+        match prepare.val {
+            OPT => {
+                if opt_set.contains_key(&prepare.author) {
+                    return Err(ConsensusError::AuthorityReuseinPrePare(prepare.author));
+                }
+                opt_set.insert(prepare.author, prepare.signature);
+                if opt_set.len() == self.committee.random_coin_threshold() {
+                    //启动smvba
+                }
+            }
+            PES => {
+                if pes_set.contains_key(&prepare.author) {
+                    return Err(ConsensusError::AuthorityReuseinPrePare(prepare.author));
+                }
+                pes_set.insert(prepare.author, prepare.signature);
+                if opt_set.len() == self.committee.quorum_threshold() {
+                    //启动smvba
+                }
+            }
+            _ => return ConsensusError::InvalidPrepareTag(prepare.val),
+        }
+
+        return Ok(());
     }
 
     //SMVBA only deal current round
@@ -788,7 +794,7 @@ impl Core {
         }
         if self.parameters.exp == 1 {
             //验证Proof是否正确
-            value.verify(&self.committee, &proof, &self.pk_set)?;
+            value.verify(&self.committee, &proof)?;
         }
 
         self.process_spb_propose(&value, &proof).await?;
@@ -809,21 +815,11 @@ impl Core {
             ConsensusError::TimeOutMessage(spb_vote.height, spb_vote.round)
         );
 
-        // if *self
-        //     .spb_abandon_flag
-        //     .entry((spb_vote.height, spb_vote.round))
-        //     .or_insert(false)
-        // {
-        //     return Ok(());
-        // }
         if self.parameters.exp == 1 {
-            spb_vote.verify(&self.committee, &self.pk_set)?;
+            spb_vote.verify(&self.committee)?;
         }
         if let Some(proof) = self.aggregator.add_spb_vote(spb_vote.clone())? {
             debug!("Create spb proof {:?}!", proof);
-            // println!("Create spb proof {:?}!", proof);
-            // self.spb_current_phase
-            //     .insert((spb_vote.height, spb_vote.round), proof.phase); //phase + 1
 
             let value = self.spb_proposes.get(&(proof.height, proof.round)).unwrap();
             //进行下一阶段的发送
@@ -860,7 +856,7 @@ impl Core {
         );
 
         if self.parameters.exp == 1 {
-            value.verify(&self.committee, &proof, &self.pk_set)?;
+            value.verify(&self.committee, &proof)?;
         }
 
         self.spb_finishs
@@ -959,7 +955,7 @@ impl Core {
         )
         .await;
 
-        let message = ConsensusMessage::SPBDone(mdone.clone());
+        let message = ConsensusMessage::SPBDoneAndShare(mdone.clone());
         Synchronizer::transmit(
             message,
             &self.name,
@@ -995,7 +991,7 @@ impl Core {
         );
 
         if self.parameters.exp == 1 {
-            prevote.verify(&self.committee, &self.pk_set)?;
+            prevote.verify(&self.committee)?;
         }
 
         let y_flag = self
@@ -1257,7 +1253,7 @@ impl Core {
         }
 
         if halt.author == self.name {
-            self.smvba_halt_falg.insert((halt.height, halt.round), true);
+            self.smvba_halt_falg.insert(halt.height, true);
         }
 
         if self.parameters.exp == 1 {
@@ -1294,423 +1290,6 @@ impl Core {
         Ok(())
     }
 
-    async fn handle_par_prepare(&mut self, prepare: PrePare) -> ConsensusResult<()> {
-        debug!("Processing {:?}", prepare);
-
-        if prepare.epoch != self.epoch || prepare.height + 2 <= self.height {
-            return Ok(());
-        }
-
-        if self.parameters.exp == 1 {
-            prepare.verify(&self.committee, &self.pk_set)?;
-        }
-
-        let opt_set = self
-            .par_prepare_opts
-            .entry(prepare.height)
-            .or_insert(HashSet::new());
-        let pes_set = self
-            .par_prepare_pess
-            .entry(prepare.height)
-            .or_insert(HashSet::new());
-
-        ensure!(
-            !opt_set.contains(&prepare.author) && !pes_set.contains(&prepare.author),
-            ConsensusError::AuthorityReuseinPrePare(prepare.author)
-        );
-
-        let vals = self
-            .par_values
-            .entry(prepare.height)
-            .or_insert([None, None]);
-
-        let val = prepare.tag as usize;
-        let height = prepare.height;
-
-        if vals[prepare.tag as usize].is_none() {
-            vals[prepare.tag as usize] = Some(prepare.block)
-        }
-
-        match prepare.tag {
-            OPT => opt_set.insert(prepare.author),
-            PES => pes_set.insert(prepare.author),
-            _ => return Err(ConsensusError::InvalidPrePareTag(prepare.tag)),
-        };
-        let opt_nums = opt_set.len() as Stake;
-        let pes_nums = pes_set.len() as Stake;
-        let mut aba_val: Option<ABAVal> = None;
-        if opt_nums + pes_nums == self.committee.quorum_threshold() {
-            if opt_nums == self.committee.quorum_threshold() {
-                // 啥事不干 已经保证了至少有f+1诚实节点已经收到了h-1高度的propose
-            } else if opt_nums > 0 {
-                aba_val = Some(
-                    ABAVal::new(
-                        self.name,
-                        self.epoch,
-                        prepare.height,
-                        1,
-                        0,
-                        VAL_PHASE,
-                        self.signature_service.clone(),
-                    )
-                    .await,
-                )
-            } else {
-                //invoke aba -> 1
-                aba_val = Some(
-                    ABAVal::new(
-                        self.name,
-                        self.epoch,
-                        prepare.height,
-                        1,
-                        1,
-                        VAL_PHASE,
-                        self.signature_service.clone(),
-                    )
-                    .await,
-                )
-            }
-        }
-
-        if let Some(val) = aba_val {
-            self.handle_aba_val(val.clone()).await?;
-            let message = ConsensusMessage::ParABAVal(val);
-            Synchronizer::transmit(
-                message,
-                &self.name,
-                None,
-                &self.network_filter_smvba,
-                &self.committee,
-                PES,
-            )
-            .await?;
-        }
-
-        //wait value?
-        let wait = self.par_value_wait.entry(height).or_insert([false, false]);
-        if wait[val] {
-            wait[val] = false;
-            self.handle_par_out(height, val).await?;
-        }
-
-        Ok(())
-    }
-
-    fn aba_message_filter(
-        &mut self,
-        epoch: SeqNumber,
-        height: SeqNumber,
-        round: SeqNumber,
-        phase: u8,
-    ) -> bool {
-        if epoch != self.epoch || height + 2 <= self.height || phase > MUX_PHASE {
-            return false;
-        }
-        let cur_round = self.aba_current_round.entry(height).or_insert(1);
-        if *cur_round > round {
-            return false;
-        }
-
-        if self.aba_output.entry(height).or_insert(None).is_some() {
-            return false;
-        }
-
-        true
-    }
-
-    // val phase and aux phase
-    #[async_recursion]
-    async fn handle_aba_val(&mut self, aba_val: ABAVal) -> ConsensusResult<()> {
-        debug!("Processing {:?}", aba_val);
-
-        if self.parameters.exp == 1 {
-            aba_val.verify()?;
-        }
-
-        if !self.aba_message_filter(aba_val.epoch, aba_val.height, aba_val.round, aba_val.phase) {
-            return Ok(());
-        }
-
-        if self
-            .aba_output
-            .entry(aba_val.height)
-            .or_insert(None)
-            .is_some()
-        {
-            return Ok(());
-        }
-
-        let used = self
-            .aba_vals_used
-            .entry((aba_val.height, aba_val.round, aba_val.phase))
-            .or_insert(HashSet::new());
-
-        ensure!(
-            used.insert(aba_val.author),
-            ConsensusError::AuthorityReuseinABA(aba_val.author, aba_val.phase)
-        );
-
-        let temp_vals = self
-            .aba_temp_vals
-            .entry((aba_val.height, aba_val.round, aba_val.phase))
-            .or_insert([0, 0]);
-
-        temp_vals[aba_val.val] += 1;
-
-        if aba_val.phase == VAL_PHASE {
-            if temp_vals[aba_val.val] == self.committee.random_coin_threshold() //f+1
-                && !used.contains(&self.name)
-            {
-                used.insert(self.name);
-                temp_vals[aba_val.val] += 1;
-                let val_t = ABAVal::new(
-                    self.name,
-                    self.epoch,
-                    aba_val.height,
-                    aba_val.round,
-                    aba_val.val,
-                    VAL_PHASE,
-                    self.signature_service.clone(),
-                )
-                .await;
-                let message = ConsensusMessage::ParABAVal(val_t);
-                Synchronizer::transmit(
-                    message,
-                    &self.name,
-                    None,
-                    &self.network_filter_smvba,
-                    &self.committee,
-                    PES,
-                )
-                .await?;
-            }
-
-            if temp_vals[aba_val.val] == self.committee.quorum_threshold() {
-                //2f+1
-                self.aba_bin_vals
-                    .entry((aba_val.height, aba_val.round))
-                    .or_insert([false, false])[aba_val.val] = true;
-                let mux = ABAVal::new(
-                    self.name,
-                    self.epoch,
-                    aba_val.height,
-                    aba_val.round,
-                    aba_val.val,
-                    MUX_PHASE,
-                    self.signature_service.clone(),
-                )
-                .await;
-                let message = ConsensusMessage::ParABAVal(mux.clone());
-                Synchronizer::transmit(
-                    message,
-                    &self.name,
-                    None,
-                    &self.network_filter_smvba,
-                    &self.committee,
-                    PES,
-                )
-                .await?;
-                self.handle_aba_val(mux).await?;
-            }
-        } else {
-            let bin_vals = self
-                .aba_bin_vals
-                .entry((aba_val.height, aba_val.round))
-                .or_insert([false, false]);
-
-            let mux_vals = self
-                .aba_mux_vals
-                .entry((aba_val.height, aba_val.round))
-                .or_insert([false, false]);
-
-            let mut flag = false;
-
-            if !(mux_vals[0] | mux_vals[1]) {
-                let weight = self.committee.quorum_threshold();
-
-                if temp_vals[0] >= weight && bin_vals[0] {
-                    mux_vals[0] = true;
-                    flag = true;
-                } else if temp_vals[1] >= weight && bin_vals[1] {
-                    mux_vals[1] = true;
-                    flag = true;
-                } else if temp_vals[1] + temp_vals[0] >= weight && bin_vals[0] & bin_vals[1] {
-                    *mux_vals = [true, true];
-                    flag = true;
-                }
-            }
-
-            if flag {
-                let share = RandomnessShare::new(
-                    aba_val.height,
-                    self.epoch,
-                    aba_val.round,
-                    self.name,
-                    self.signature_service.clone(),
-                )
-                .await;
-
-                let message = ConsensusMessage::ParABACoinShare(share.clone());
-
-                Synchronizer::transmit(
-                    message,
-                    &self.name,
-                    None,
-                    &self.network_filter_smvba,
-                    &self.committee,
-                    PES,
-                )
-                .await?;
-
-                self.handle_aba_rs(share).await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn handle_aba_rs(&mut self, share: RandomnessShare) -> ConsensusResult<()> {
-        debug!("Processing aba coin share {:?}", share);
-
-        if self.parameters.exp == 1 {
-            share.verify(&self.committee, &self.pk_set)?;
-        }
-
-        if !self.aba_message_filter(share.epoch, share.height, share.round, MUX_PHASE) {
-            return Ok(());
-        }
-
-        let height = share.height;
-        let round = share.round;
-
-        let mux_vals = self
-            .aba_mux_vals
-            .entry((share.height, share.round))
-            .or_insert([false, false]);
-        if let Some(coin) = self.aggregator.add_aba_random(share, &self.pk_set)? {
-            let mut val = coin;
-            if mux_vals[0] ^ mux_vals[1] {
-                if mux_vals[coin] {
-                    //TODO broadcast aba exit message
-                    let aba_out = ABAOutput::new(
-                        self.name,
-                        self.epoch,
-                        height,
-                        round,
-                        coin,
-                        self.signature_service.clone(),
-                    )
-                    .await;
-
-                    let message = ConsensusMessage::ParABAOutput(aba_out.clone());
-                    Synchronizer::transmit(
-                        message,
-                        &self.name,
-                        None,
-                        &self.network_filter_smvba,
-                        &self.committee,
-                        PES,
-                    )
-                    .await?;
-
-                    return self.handle_aba_output(aba_out).await;
-                } else {
-                    val = coin ^ 1;
-                }
-            }
-            // into next round
-            let aba_val = ABAVal::new(
-                self.name,
-                self.epoch,
-                height,
-                round + 1,
-                val,
-                VAL_PHASE,
-                self.signature_service.clone(),
-            )
-            .await;
-            let message = ConsensusMessage::ParABAVal(aba_val.clone());
-
-            Synchronizer::transmit(
-                message,
-                &self.name,
-                None,
-                &self.network_filter_smvba,
-                &self.committee,
-                PES,
-            )
-            .await?;
-
-            self.handle_aba_val(aba_val).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn handle_aba_output(&mut self, aba_out: ABAOutput) -> ConsensusResult<()> {
-        debug!("Processing {:?}", aba_out);
-
-        if self.parameters.exp == 1 {
-            aba_out.verify()?;
-        }
-
-        if !self.aba_message_filter(aba_out.epoch, aba_out.height, aba_out.round, MUX_PHASE) {
-            return Ok(());
-        }
-
-        let height = aba_out.height;
-        let round = aba_out.round;
-
-        let out_set = self
-            .aba_output_messages
-            .entry(height)
-            .or_insert(HashSet::new());
-
-        ensure!(
-            out_set.insert(aba_out.author),
-            ConsensusError::AuthorityReuseinABAOut(aba_out.author)
-        );
-
-        let mut nums = out_set.len() as Stake;
-
-        if nums == self.committee.random_coin_threshold() && !out_set.contains(&self.name) {
-            //f+1
-
-            let out = ABAOutput::new(
-                self.name,
-                self.epoch,
-                height,
-                round,
-                aba_out.val,
-                self.signature_service.clone(),
-            )
-            .await;
-
-            let message = ConsensusMessage::ParABAOutput(out);
-            Synchronizer::transmit(
-                message,
-                &self.name,
-                None,
-                &self.network_filter_smvba,
-                &self.committee,
-                PES,
-            )
-            .await?;
-
-            out_set.insert(self.name);
-            nums += 1;
-        }
-
-        if nums == self.committee.quorum_threshold() {
-            self.aba_output
-                .entry(self.height)
-                .or_insert(Some(aba_out.val));
-            self.handle_par_out(height, aba_out.val).await?;
-        }
-
-        Ok(())
-    }
-
     async fn handle_par_out(&mut self, height: SeqNumber, val: usize) -> ConsensusResult<()> {
         //TODO deal
         if height < self.last_committed_height {
@@ -1725,8 +1304,6 @@ impl Core {
             if val as u8 == PES {
                 block.tag = PES;
             }
-            // Process the QC. This may allow us to advance round.
-            self.process_qc(&block.qc).await;
 
             // Let's see if we have the block's data. If we don't, the mempool
             // will get it and then make us resume processing this block.
@@ -1853,16 +1430,13 @@ impl Core {
                         ConsensusMessage::SPBPropose(value,proof)=> self.handle_spb_proposal(value,proof).await,
                         ConsensusMessage::SPBVote(vote)=> self.handle_spb_vote(&vote).await,
                         ConsensusMessage::SPBFinsh(value,proof)=> self.handle_spb_finish(value,proof).await,
-                        ConsensusMessage::SPBDone(done) => self.handle_smvba_done(done).await,
+                        ConsensusMessage::SPBDoneAndShare(done) => self.handle_smvba_done(done).await,
                         ConsensusMessage::SMVBAPreVote(prevote) => self.handle_smvba_prevote(prevote).await,
                         ConsensusMessage::SMVBAVote(mvote) => self.handle_smvba_mvote(mvote).await,
                         ConsensusMessage::SMVBACoinShare(random_share)=> self.handle_smvba_rs(random_share).await,
                         ConsensusMessage::SMVBAHalt(halt) => self.handle_smvba_halt(halt).await,
                         ConsensusMessage::ParPrePare(prepare) => self.handle_par_prepare(prepare).await,
-                        ConsensusMessage::ParABAVal(aba_val) => self.handle_aba_val(aba_val).await,
-                        ConsensusMessage::ParABAOutput(aba_out) => self.handle_aba_output(aba_out).await,
                         ConsensusMessage::ParLoopBack(block) => self.process_par_out(&block).await,
-                        ConsensusMessage::ParABACoinShare(rs) => self.handle_aba_rs(rs).await,
                         _=> Ok(()),
                     }
                 },
