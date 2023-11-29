@@ -12,13 +12,10 @@ use crate::synchronizer::Synchronizer;
 use async_recursion::async_recursion;
 use crypto::{Digest, PublicKey, SignatureService};
 use crypto::{Hash as _, Signature};
-use futures::sink::Fanout;
-use futures::stream::Peek;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::cmp::max;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::ops::Deref;
 use store::Store;
 use threshold_crypto::PublicKeySet;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -35,9 +32,6 @@ pub type SeqNumber = u64; // For both round and view
 
 pub const OPT: u8 = 0;
 pub const PES: u8 = 1;
-
-pub const VAL_PHASE: u8 = 0;
-pub const MUX_PHASE: u8 = 1;
 
 pub const INIT_PHASE: u8 = 0;
 pub const LOCK_PHASE: u8 = 1;
@@ -345,8 +339,10 @@ impl Core {
 
             // Make a new block if we are the next leader.
             if self.name == self.leader_elector.get_leader(self.height) {
-                let block = self.generate_proposal(self.height, Some(self.high_qc.clone()), OPT);
-                self.broadcast_opt_propose(block.clone().unwrap()).await?;
+                let block = self
+                    .generate_proposal(self.height, Some(self.high_qc.clone()), OPT)
+                    .await;
+                self.broadcast_opt_propose(block).await?;
             }
         }
         Ok(())
@@ -380,9 +376,11 @@ impl Core {
             shares: Vec::new(),
         };
 
-        let last_value = self.spb_proposes.get(&(height, round - 1)).unwrap();
+        let last_value = self.spb_proposes.get(&(height, round - 1)).unwrap().clone();
 
-        let block = self.generate_proposal(height, Some(last_value.block.qc.clone()), PES);
+        let block = self
+            .generate_proposal(height, Some(last_value.block.qc.clone()), PES)
+            .await;
 
         let value = SPBValue::new(
             block,
@@ -399,7 +397,8 @@ impl Core {
         Ok(())
     }
 
-    fn generate_proposal(&mut self, height: SeqNumber, qc: Option<QC>, tag: u8) -> Block {
+    #[async_recursion]
+    async fn generate_proposal(&mut self, height: SeqNumber, qc: Option<QC>, tag: u8) -> Block {
         // Make a new block.
         let payload = self
             .mempool_driver
@@ -411,8 +410,8 @@ impl Core {
             height,
             self.epoch,
             payload,
-            tag,
             self.signature_service.clone(),
+            tag,
         )
         .await;
 
@@ -699,8 +698,8 @@ impl Core {
         signatures: Vec<(PublicKey, Signature)>,
         qc: Option<QC>,
     ) -> ConsensusResult<()> {
-        let block = self.generate_proposal(height, qc, PES);
-        let value = SPBValue::new(block, 1, INIT_PHASE, val, sigantures);
+        let block = self.generate_proposal(height, qc, PES).await;
+        let value = SPBValue::new(block, 1, INIT_PHASE, val, signatures);
         let proof = SPBProof {
             phase: INIT_PHASE,
             round: 1,
@@ -780,7 +779,7 @@ impl Core {
                 if opt_set.contains_key(&prepare.author) {
                     return Err(ConsensusError::AuthorityReuseinPrePare(prepare.author));
                 }
-                opt_set.insert(prepare.author, prepare.signature);
+                opt_set.insert(prepare.author, prepare.signature.clone());
 
                 //如果没有广播过 0
                 if !self.prepare_tag.contains_key(&prepare.height) {
@@ -788,14 +787,14 @@ impl Core {
                         self.name,
                         self.epoch,
                         prepare.height,
-                        prepare.proof,
+                        prepare.proof.clone(),
                         prepare.val,
                         self.signature_service.clone(),
                     )
                     .await;
                     self.prepare_tag.insert(prepare.height, temp.clone());
-                    opt_set.insert(temp.height, temp.signature);
-                    let messages = ConsensusMessage::ParPrePare(temp);
+                    opt_set.insert(temp.author, temp.signature.clone());
+                    let message = ConsensusMessage::ParPrePare(temp);
                     Synchronizer::transmit(
                         message,
                         &self.name,
@@ -807,10 +806,14 @@ impl Core {
                     .await?;
                 }
 
-                if opt_set.len() == self.committee.random_coin_threshold() {
+                if (opt_set.len() as u32) == self.committee.random_coin_threshold() {
                     //启动smvba
-                    let signatures = opt_set.into_iter().collect();
-                    if let PrePareProof::OPTProof(qc) = prepare.proof {
+                    let signatures = opt_set
+                        .into_iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+
+                    if let PrePareProof::OPTProof(qc) = prepare.proof.clone() {
                         self.invoke_smvba(prepare.height, OPT, signatures, Some(qc))
                             .await?;
                     }
@@ -821,14 +824,17 @@ impl Core {
                     return Err(ConsensusError::AuthorityReuseinPrePare(prepare.author));
                 }
                 pes_set.insert(prepare.author, prepare.signature);
-                let signatures = opt_set.into_iter().collect();
-                if opt_set.len() == self.committee.quorum_threshold() {
+                let signatures = pes_set
+                    .into_iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                if (pes_set.len() as u32) == self.committee.quorum_threshold() {
                     //启动smvba
                     self.invoke_smvba(prepare.height, PES, signatures, None)
                         .await?;
                 }
             }
-            _ => return ConsensusError::InvalidPrepareTag(prepare.val),
+            _ => return Err(ConsensusError::InvalidPrePareTag(prepare.val)),
         }
 
         return Ok(());
@@ -855,11 +861,7 @@ impl Core {
             return Err(ConsensusError::EpochEnd(self.epoch));
         }
 
-        if *self
-            .spb_abandon_flag
-            .entry((proof.height, proof.round))
-            .or_insert(false)
-        {
+        if *self.spb_abandon_flag.entry(proof.height).or_insert(false) {
             return Ok(());
         }
         if self.parameters.exp == 1 {
@@ -1000,8 +1002,7 @@ impl Core {
         // 2f+1?
         if weight == self.committee.quorum_threshold() {
             //abandon spb message
-            self.spb_abandon_flag
-                .insert((mdone.height, mdone.round), true);
+            self.spb_abandon_flag.insert(mdone.height, true);
         }
 
         self.handle_smvba_rs(&mdone.share).await?;
@@ -1214,7 +1215,10 @@ impl Core {
         let height = share.height;
         let round = share.round;
 
-        if let Some(coin) = self.aggregator.add_smvba_random(share, &self.pk_set)? {
+        if let Some(coin) = self
+            .aggregator
+            .add_smvba_random(share.clone(), &self.pk_set)?
+        {
             self.leader_elector.add_random_coin(coin.clone());
 
             let leader = coin.leader;
@@ -1353,12 +1357,12 @@ impl Core {
     ) -> ConsensusResult<()> {
         //TODO deal
         self.smvba_halt_values.insert(height, value.block.clone());
-        self.store_block(&value.block);
+        self.store_block(&value.block).await;
         if value.val == OPT {
             self.active_prepare_pahse(height + 1, PrePareProof::PESProof(proof.clone()), PES)
                 .await?;
             //stop vote to height+1
-        } else if value == PES {
+        } else if value.val == PES {
             //commit PES: h-1 ,h OPT: [:h-2]
             let last_block = self
                 .smvba_halt_values
@@ -1369,17 +1373,6 @@ impl Core {
             current_block.qc = QC::genesis();
             current_block.qc.hash = last_block.digest();
 
-            // if !self
-            //     .mempool_driver
-            //     .verify(current_block.clone(), PES)
-            //     .await?
-            // {
-            //     debug!(
-            //         "Processing of {} suspended: missing payload",
-            //         block.digest()
-            //     );
-            //     return Ok(());
-            // }
             self.process_par_out(&current_block).await?;
         }
 
@@ -1453,7 +1446,9 @@ impl Core {
 
         if self.opt_path && self.name == self.leader_elector.get_leader(self.height) {
             //如果是leader就发送propose
-            let block = self.generate_proposal(self.height, Some(self.high_qc.clone()), OPT);
+            let block = self
+                .generate_proposal(self.height, Some(self.high_qc.clone()), OPT)
+                .await;
             self.broadcast_opt_propose(block)
                 .await
                 .expect("Failed to send the OPT block");

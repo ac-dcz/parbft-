@@ -256,12 +256,16 @@ impl Hash for PrePare {
 impl fmt::Debug for PrePare {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut tag = String::from("Unkonw");
-        if self.tag == OPT {
+        if self.val == OPT {
             tag = "OPT".to_string();
-        } else if self.tag == PES {
+        } else if self.val == PES {
             tag = "PES".to_string();
         }
-        write!(f, "PrePare(tag {}, block {:?})", tag, self.block)
+        write!(
+            f,
+            "PrePare(tag {}, height {}, author {})",
+            tag, self.height, self.author
+        )
     }
 }
 
@@ -275,12 +279,12 @@ pub struct SPBValue {
 }
 
 impl SPBValue {
-    pub async fn new(
+    pub fn new(
         block: Block,
         round: SeqNumber,
         phase: u8,
         val: u8,
-        sigantures: Vec<(PublicKey, Signature)>,
+        signatures: Vec<(PublicKey, Signature)>,
     ) -> Self {
         Self {
             block,
@@ -293,27 +297,24 @@ impl SPBValue {
 
     pub fn aba_val_digest(val: u8) -> Digest {
         let mut hasher = Sha512::new();
-        hasher.update(self.val.to_le_bytes());
+        hasher.update(val.to_le_bytes());
         Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
     }
 
     pub fn verify(&self, committee: &Committee, proof: &SPBProof) -> ConsensusResult<()> {
         let mut flag = true;
-
-        if self.val == OPT && self.signatures.len() < committee.random_coin_threshold() {
+        let weight = self.signatures.len() as u32;
+        if self.val == OPT && weight < committee.random_coin_threshold() {
             flag = false;
-        } else if self.val == PES && self.signatures.len() < committee.quorum_threshold() {
-            flag = false;
-        } else {
+        } else if self.val == PES && weight < committee.quorum_threshold() {
             flag = false;
         }
-
         if flag {
             // Check the signatures.
             Signature::verify_batch(&SPBValue::aba_val_digest(self.val), &self.signatures)
-                .map_err(ConsensusError::from)
+                .map_err(ConsensusError::from)?;
         } else {
-            return Err(ConsensusError::InvalidPrepareTag(self.val));
+            return Err(ConsensusError::InvalidPrePareTag(self.val));
         }
 
         self.block.verify(committee)?;
@@ -501,7 +502,7 @@ impl MDoneAndShare {
 
     pub fn verify(&self, committee: &Committee, pk_set: &PublicKeySet) -> ConsensusResult<()> {
         self.signature.verify(&self.digest(), &self.author)?;
-        // self.share.verify(committee, pk_set)?;
+        self.share.verify(committee, pk_set)?;
         Ok(())
     }
 }
@@ -746,7 +747,7 @@ impl MVote {
         return pvote;
     }
 
-    pub fn verify(&self, committee: &Committee, pk_set: &PublicKeySet) -> ConsensusResult<()> {
+    pub fn verify(&self, committee: &Committee, _pk_set: &PublicKeySet) -> ConsensusResult<()> {
         // Ensure the authority has voting rights.
         let voting_rights = committee.stake(&self.author);
         ensure!(
@@ -819,7 +820,7 @@ impl MHalt {
         return halt;
     }
 
-    pub fn verify(&self, committee: &Committee, pk_set: &PublicKeySet) -> ConsensusResult<()> {
+    pub fn verify(&self, committee: &Committee, _pk_set: &PublicKeySet) -> ConsensusResult<()> {
         // Ensure the authority has voting rights.
         let voting_rights = committee.stake(&self.author);
         ensure!(
