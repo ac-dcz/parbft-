@@ -182,15 +182,15 @@ impl fmt::Display for HVote {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum PrePareProof {
-    OPT(QC),
-    PES(SPBProof),
+    OPTProof(QC),
+    PESProof(SPBProof),
 }
 
 impl PrePareProof {
     pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
         match self {
-            Self::OPT(qc) => qc.verify(committee),
-            Self::PES(proof) => {
+            Self::OPTProof(qc) => qc.verify(committee),
+            Self::PESProof(proof) => {
                 ensure!(proof.phase == FIN_PHASE, ConsensusError::InvalidFinProof());
                 proof.verify(committee)
             }
