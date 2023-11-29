@@ -13,10 +13,12 @@ use async_recursion::async_recursion;
 use crypto::{Digest, PublicKey, SignatureService};
 use crypto::{Hash as _, Signature};
 use futures::sink::Fanout;
+use futures::stream::Peek;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::cmp::max;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::Deref;
 use store::Store;
 use threshold_crypto::PublicKeySet;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -54,8 +56,7 @@ pub enum ConsensusMessage {
     SPBDoneAndShare(MDoneAndShare),
     SMVBAPreVote(MPreVote),
     SMVBAVote(MVote),
-    SMVBACoinShare(RandomnessShare), //elect leader
-    SMVBAHalt(MHalt),                //mvba halt
+    SMVBAHalt(MHalt), //mvba halt
     ParPrePare(PrePare),
     ParLoopBack(Block),
 }
@@ -95,6 +96,7 @@ pub struct Core {
     spb_current_phase: HashMap<(SeqNumber, SeqNumber), u8>,
     spb_abandon_flag: HashMap<SeqNumber, bool>,
     smvba_halt_falg: HashMap<SeqNumber, bool>,
+    smvba_halt_values: HashMap<SeqNumber, Block>,
     smvba_dones: HashMap<(SeqNumber, SeqNumber), HashSet<PublicKey>>,
     smvba_current_round: HashMap<SeqNumber, SeqNumber>, // height->round
     smvba_votes: HashMap<(SeqNumber, SeqNumber), HashSet<PublicKey>>, // 记录所有的投票数量
@@ -161,6 +163,7 @@ impl Core {
             spb_current_phase: HashMap::new(),
             spb_abandon_flag: HashMap::new(),
             smvba_halt_falg: HashMap::new(),
+            smvba_halt_values: HashMap::new(),
             smvba_current_round: HashMap::new(),
             smvba_dones: HashMap::new(),
             smvba_votes: HashMap::new(),
@@ -193,6 +196,7 @@ impl Core {
         self.spb_current_phase.clear();
         self.spb_abandon_flag.clear();
         self.smvba_halt_falg.clear();
+        self.smvba_halt_values.clear();
         self.smvba_current_round.clear();
         self.smvba_dones.clear();
         self.smvba_votes.clear();
@@ -239,6 +243,7 @@ impl Core {
         self.prepare_tag.retain(|h, _| h > height);
         self.par_prepare_opts.retain(|h, _| h > height);
         self.par_prepare_pess.retain(|h, _| h > height);
+        self.smvba_halt_values.retain(|h, _| h > height);
     }
 
     async fn store_block(&mut self, block: &Block) {
@@ -340,7 +345,7 @@ impl Core {
 
             // Make a new block if we are the next leader.
             if self.name == self.leader_elector.get_leader(self.height) {
-                let block = self.generate_proposal(self.height, Some(self.high_qc.clone()));
+                let block = self.generate_proposal(self.height, Some(self.high_qc.clone()), OPT);
                 self.broadcast_opt_propose(block.clone().unwrap()).await?;
             }
         }
@@ -377,7 +382,7 @@ impl Core {
 
         let last_value = self.spb_proposes.get(&(height, round - 1)).unwrap();
 
-        let block = self.generate_proposal(height, Some(last_value.block.qc.clone()));
+        let block = self.generate_proposal(height, Some(last_value.block.qc.clone()), PES);
 
         let value = SPBValue::new(
             block,
@@ -394,7 +399,7 @@ impl Core {
         Ok(())
     }
 
-    fn generate_proposal(&mut self, height: SeqNumber, qc: Option<QC>) -> Block {
+    fn generate_proposal(&mut self, height: SeqNumber, qc: Option<QC>, tag: u8) -> Block {
         // Make a new block.
         let payload = self
             .mempool_driver
@@ -406,9 +411,11 @@ impl Core {
             height,
             self.epoch,
             payload,
+            tag,
             self.signature_service.clone(),
         )
         .await;
+
         if !block.payload.is_empty() {
             info!("Created {} epoch {}", block, block.epoch);
 
@@ -692,7 +699,7 @@ impl Core {
         signatures: Vec<(PublicKey, Signature)>,
         qc: Option<QC>,
     ) -> ConsensusResult<()> {
-        let block = self.generate_proposal(height, qc);
+        let block = self.generate_proposal(height, qc, PES);
         let value = SPBValue::new(block, 1, INIT_PHASE, val, sigantures);
         let proof = SPBProof {
             phase: INIT_PHASE,
@@ -957,7 +964,7 @@ impl Core {
         Ok(())
     }
 
-    async fn handle_smvba_done(&mut self, mdone: MDone) -> ConsensusResult<()> {
+    async fn handle_smvba_done_with_share(&mut self, mdone: MDoneAndShare) -> ConsensusResult<()> {
         debug!("Processing  {:?}", mdone);
 
         ensure!(
@@ -966,7 +973,7 @@ impl Core {
         );
 
         if self.parameters.exp == 1 {
-            mdone.verify()?;
+            mdone.verify(&self.committee, &self.pk_set)?;
         }
 
         let d_flag = self
@@ -997,6 +1004,8 @@ impl Core {
                 .insert((mdone.height, mdone.round), true);
         }
 
+        self.handle_smvba_rs(&mdone.share).await?;
+
         Ok(())
     }
 
@@ -1006,21 +1015,22 @@ impl Core {
         height: SeqNumber,
         round: SeqNumber,
     ) -> ConsensusResult<()> {
-        let mdone = MDone::new(
-            self.name,
-            self.signature_service.clone(),
-            self.epoch,
-            height,
-            round,
-        )
-        .await;
-
         let share = RandomnessShare::new(
             height,
             self.epoch,
             round,
             self.name,
             self.signature_service.clone(),
+        )
+        .await;
+
+        let mdone = MDoneAndShare::new(
+            self.name,
+            self.signature_service.clone(),
+            self.epoch,
+            height,
+            round,
+            share,
         )
         .await;
 
@@ -1035,19 +1045,7 @@ impl Core {
         )
         .await?;
 
-        let message = ConsensusMessage::SMVBACoinShare(share.clone());
-        Synchronizer::transmit(
-            message,
-            &self.name,
-            None,
-            &self.network_filter_smvba,
-            &self.committee,
-            PES,
-        )
-        .await?;
-
-        self.handle_smvba_done(mdone).await?;
-        self.handle_smvba_rs(share).await?;
+        self.handle_smvba_done_with_share(mdone).await?;
         Ok(())
     }
 
@@ -1194,7 +1192,7 @@ impl Core {
         Ok(())
     }
 
-    async fn handle_smvba_rs(&mut self, share: RandomnessShare) -> ConsensusResult<()> {
+    async fn handle_smvba_rs(&mut self, share: &RandomnessShare) -> ConsensusResult<()> {
         debug!("Processing  {:?}", share);
 
         ensure!(
@@ -1329,6 +1327,18 @@ impl Core {
             halt.verify(&self.committee, &self.pk_set)?;
         }
 
+        // if !self
+        //     .mempool_driver
+        //     .verify(halt.value.block.clone(), PES)
+        //     .await?
+        // {
+        //     debug!(
+        //         "Processing of {} suspended: missing payload",
+        //         halt.value.block.digest()
+        //     );
+        //     return Ok(());
+        // }
+
         self.handle_smvba_out(halt.height, &halt.value, &halt.proof)
             .await?;
 
@@ -1342,48 +1352,42 @@ impl Core {
         proof: &SPBProof,
     ) -> ConsensusResult<()> {
         //TODO deal
-        ensure!(
-            height + 2 > self.height,
-            ConsensusError::TimeOutMessage(self.epoch, height)
-        );
-
+        self.smvba_halt_values.insert(height, value.block.clone());
+        self.store_block(&value.block);
         if value.val == OPT {
             self.active_prepare_pahse(height + 1, PrePareProof::PESProof(proof.clone()), PES)
                 .await?;
-        } else {
+            //stop vote to height+1
+        } else if value == PES {
             //commit PES: h-1 ,h OPT: [:h-2]
+            let last_block = self
+                .smvba_halt_values
+                .get(&(height - 1))
+                .expect("not found last halt phase value");
+
+            let mut current_block = value.block.clone();
+            current_block.qc = QC::genesis();
+            current_block.qc.hash = last_block.digest();
+
+            // if !self
+            //     .mempool_driver
+            //     .verify(current_block.clone(), PES)
+            //     .await?
+            // {
+            //     debug!(
+            //         "Processing of {} suspended: missing payload",
+            //         block.digest()
+            //     );
+            //     return Ok(());
+            // }
+            self.process_par_out(&current_block).await?;
         }
 
-        // let values = self.par_values.entry(height).or_insert([None, None]);
-
-        // if values[val].is_some() {
-        //     //提交
-        //     let mut block = values[val].clone().unwrap();
-        //     if val as u8 == PES {
-        //         block.tag = PES;
-        //     }
-
-        //     // Let's see if we have the block's data. If we don't, the mempool
-        //     // will get it and then make us resume processing this block.
-        //     if !self.mempool_driver.verify(block.clone(), PES).await? {
-        //         debug!(
-        //             "Processing of {} suspended: missing payload",
-        //             block.digest()
-        //         );
-        //         return Ok(());
-        //     }
-
-        //     self.process_par_out(&block).await?;
-        // } else {
-        //     self.par_value_wait.entry(height).or_insert([false, false])[val] = true;
-        // }
         Ok(())
     }
 
     async fn process_par_out(&mut self, block: &Block) -> ConsensusResult<()> {
         let tag = block.tag;
-        // Store the block only if we have already processed all its ancestors.
-        self.store_block(block).await;
 
         if block.height > self.last_committed_height {
             self.commit(block).await?;
@@ -1396,14 +1400,14 @@ impl Core {
             if tag == PES {
                 //如果是悲观路径输出
                 info!(
-                    "------------ABA output 1,epoch {} end--------------",
+                    "------------BVABA output 1,epoch {} end--------------",
                     self.epoch
                 );
 
                 return Err(ConsensusError::EpochEnd(self.epoch));
             } else {
                 info!(
-                    "------------ABA output 0,epoch {}--------------",
+                    "------------BVABA output 0,epoch {}--------------",
                     self.epoch
                 );
             }
@@ -1449,7 +1453,7 @@ impl Core {
 
         if self.opt_path && self.name == self.leader_elector.get_leader(self.height) {
             //如果是leader就发送propose
-            let block = self.generate_proposal(self.height, Some(self.high_qc.clone()));
+            let block = self.generate_proposal(self.height, Some(self.high_qc.clone()), OPT);
             self.broadcast_opt_propose(block)
                 .await
                 .expect("Failed to send the OPT block");
@@ -1481,10 +1485,9 @@ impl Core {
                         ConsensusMessage::SPBPropose(value,proof)=> self.handle_spb_proposal(value,proof).await,
                         ConsensusMessage::SPBVote(vote)=> self.handle_spb_vote(&vote).await,
                         ConsensusMessage::SPBFinsh(value,proof)=> self.handle_spb_finish(value,proof).await,
-                        ConsensusMessage::SPBDoneAndShare(done) => self.handle_smvba_done(done).await,
+                        ConsensusMessage::SPBDoneAndShare(done) => self.handle_smvba_done_with_share(done).await,
                         ConsensusMessage::SMVBAPreVote(prevote) => self.handle_smvba_prevote(prevote).await,
                         ConsensusMessage::SMVBAVote(mvote) => self.handle_smvba_mvote(mvote).await,
-                        ConsensusMessage::SMVBACoinShare(random_share)=> self.handle_smvba_rs(random_share).await,
                         ConsensusMessage::SMVBAHalt(halt) => self.handle_smvba_halt(halt).await,
                         ConsensusMessage::ParPrePare(prepare) => self.handle_par_prepare(prepare).await,
                         ConsensusMessage::ParLoopBack(block) => self.process_par_out(&block).await,

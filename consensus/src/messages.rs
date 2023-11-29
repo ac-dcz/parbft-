@@ -34,6 +34,7 @@ impl Block {
         epoch: SeqNumber,
         payload: Vec<Digest>,
         mut signature_service: SignatureService,
+        tag: u8,
     ) -> Self {
         let block = Self {
             qc,
@@ -42,7 +43,7 @@ impl Block {
             epoch,
             payload,
             signature: Signature::default(),
-            tag: OPT,
+            tag,
         };
 
         let signature = signature_service.request_signature(block.digest()).await;
@@ -87,6 +88,7 @@ impl Hash for Block {
             hasher.update(x);
         }
         hasher.update(&self.qc.hash);
+        hasher.update(self.tag.to_le_bytes());
         Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
     }
 }
@@ -499,7 +501,7 @@ impl MDoneAndShare {
 
     pub fn verify(&self, committee: &Committee, pk_set: &PublicKeySet) -> ConsensusResult<()> {
         self.signature.verify(&self.digest(), &self.author)?;
-        self.share.verify(committee, pk_set)?;
+        // self.share.verify(committee, pk_set)?;
         Ok(())
     }
 }
