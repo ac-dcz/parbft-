@@ -321,7 +321,7 @@ impl Core {
 
     #[async_recursion]
     async fn handle_opt_vote(&mut self, vote: &HVote) -> ConsensusResult<()> {
-        debug!("Processing OPT Vote {:?}", vote);
+        info!("Processing OPT Vote {:?}", vote);
 
         if vote.height < self.height || self.epoch != vote.epoch {
             return Ok(());
@@ -333,7 +333,7 @@ impl Core {
         // Add the new vote to our aggregator and see if we have a quorum.
         if let Some(qc) = self.aggregator.add_hs_vote(vote.clone())? {
             debug!("Assembled {:?}", qc);
-            // println!("Assembled {:?}", qc);
+
             // Process the QC.
             self.process_qc(&qc).await;
 
@@ -367,6 +367,10 @@ impl Core {
         height: SeqNumber,
         round: SeqNumber,
     ) -> ConsensusResult<()> {
+        info!(
+            "-------------smvba round advance height {}, round {}------------",
+            height, round
+        );
         self.update_smvba_state(height, round);
 
         let proof = SPBProof {
@@ -503,8 +507,11 @@ impl Core {
             }
         };
 
+        // Store the block only if we have already processed all its ancestors.
+        self.store_block(block).await;
+
         //TODO:
-        // 1. 对 height-1 的 block 发送 prepare-opt
+        // 1. 对 height 的 block 发送 prepare-opt
         if self.pes_path {
             self.active_prepare_pahse(
                 block.height,
@@ -513,13 +520,6 @@ impl Core {
             )
             .await?;
         }
-        // 2. 终止 height-2 的 SMVBA
-        if self.pes_path && self.height > 2 {
-            self.terminate_smvba(self.height - 2).await?;
-        }
-
-        // Store the block only if we have already processed all its ancestors.
-        self.store_block(block).await;
 
         // The chain should have consecutive round numbers by construction.
         let mut consecutive_rounds = b0.height + 1 == b1.height;
@@ -553,12 +553,13 @@ impl Core {
         // See if we can vote for this block.
         if let Some(vote) = self.make_opt_vote(block).await {
             debug!("Created hs {:?}", vote);
-            if block.author != self.name {
+            let leader = self.leader_elector.get_leader(self.height + 1);
+            if leader != self.name {
                 let message = ConsensusMessage::HSVote(vote.clone());
                 Synchronizer::transmit(
                     message,
                     &self.name,
-                    Some(&block.author),
+                    Some(&leader),
                     &self.network_filter,
                     &self.committee,
                     OPT,
@@ -632,6 +633,11 @@ impl Core {
         // Check the block is correctly formed.
         block.verify(&self.committee)?;
 
+        // 2. 终止 height-2 的 SMVBA
+        if self.pes_path && self.height > 2 {
+            self.terminate_smvba(self.height - 2)?;
+        }
+
         // Process the QC. This may allow us to advance round.
         self.process_qc(&block.qc).await;
 
@@ -685,7 +691,7 @@ impl Core {
         Ok(())
     }
 
-    async fn terminate_smvba(&mut self, height: SeqNumber) -> ConsensusResult<()> {
+    fn terminate_smvba(&mut self, height: SeqNumber) -> ConsensusResult<()> {
         self.clean_smvba_state(&height);
         Ok(())
     }
@@ -735,7 +741,7 @@ impl Core {
         &mut self,
         epoch: SeqNumber,
         height: SeqNumber,
-        round: SeqNumber,
+        _round: SeqNumber,
         _phase: u8,
     ) -> bool {
         if self.epoch > epoch {
@@ -744,20 +750,21 @@ impl Core {
         if self.height >= height + 2 {
             return false;
         }
-        let cur_round = self.smvba_current_round.entry(height).or_insert(1);
-        if *cur_round > round {
-            return false;
-        }
+        // let cur_round = self.smvba_current_round.entry(height).or_insert(1);
+        // if *cur_round > round {
+        //     return false;
+        // }
 
-        // halt?
-        if *self.smvba_halt_falg.entry(height).or_insert(false) {
-            return false;
-        }
+        // // halt?
+        // if *self.smvba_halt_falg.entry(height).or_insert(false) {
+        //     return false;
+        // }
 
         true
     }
 
     async fn handle_par_prepare(&mut self, prepare: PrePare) -> ConsensusResult<()> {
+        debug!("Processing {:?}", prepare);
         ensure!(
             prepare.epoch == self.epoch && prepare.height + 2 > self.height,
             ConsensusError::TimeOutMessage(prepare.epoch, prepare.height)
@@ -788,7 +795,7 @@ impl Core {
                         self.epoch,
                         prepare.height,
                         prepare.proof.clone(),
-                        prepare.val,
+                        OPT,
                         self.signature_service.clone(),
                     )
                     .await;
@@ -861,9 +868,9 @@ impl Core {
             return Err(ConsensusError::EpochEnd(self.epoch));
         }
 
-        if *self.spb_abandon_flag.entry(proof.height).or_insert(false) {
-            return Ok(());
-        }
+        // if *self.spb_abandon_flag.entry(proof.height).or_insert(false) {
+        //     return Ok(());
+        // }
         if self.parameters.exp == 1 {
             //验证Proof是否正确
             value.verify(&self.committee, &proof)?;
@@ -925,7 +932,7 @@ impl Core {
     }
 
     async fn handle_spb_finish(&mut self, value: SPBValue, proof: SPBProof) -> ConsensusResult<()> {
-        debug!("Processing finish {:?}", proof);
+        debug!("Processing finish {:?}", value);
 
         // check message is timeout?
         ensure!(
@@ -967,46 +974,8 @@ impl Core {
     }
 
     async fn handle_smvba_done_with_share(&mut self, mdone: MDoneAndShare) -> ConsensusResult<()> {
-        debug!("Processing  {:?}", mdone);
-
-        ensure!(
-            self.smvba_msg_filter(mdone.epoch, mdone.height, mdone.round, FIN_PHASE),
-            ConsensusError::TimeOutMessage(mdone.height, mdone.round)
-        );
-
-        if self.parameters.exp == 1 {
-            mdone.verify(&self.committee, &self.pk_set)?;
-        }
-
-        let d_flag = self
-            .smvba_d_flag
-            .entry((mdone.height, mdone.round))
-            .or_insert(false);
-
-        let set = self
-            .smvba_dones
-            .entry((mdone.height, mdone.round))
-            .or_insert(HashSet::new());
-        set.insert(mdone.author);
-        let mut weight = set.len() as Stake;
-
-        // d_flag= false and weight == f+1?
-        if *d_flag == false && weight == self.committee.random_coin_threshold() {
-            *d_flag = true;
-            set.insert(self.name);
-            weight += 1;
-            self.invoke_done_and_share(mdone.height, mdone.round)
-                .await?;
-        }
-
-        // 2f+1?
-        if weight == self.committee.quorum_threshold() {
-            //abandon spb message
-            self.spb_abandon_flag.insert(mdone.height, true);
-        }
-
+        self.handle_smvba_done(&mdone).await?;
         self.handle_smvba_rs(&mdone.share).await?;
-
         Ok(())
     }
 
@@ -1193,6 +1162,49 @@ impl Core {
         Ok(())
     }
 
+    async fn handle_smvba_done(&mut self, mdone: &MDoneAndShare) -> ConsensusResult<()> {
+        debug!("Processing  {:?}", mdone);
+
+        ensure!(
+            self.smvba_msg_filter(mdone.epoch, mdone.height, mdone.round, FIN_PHASE),
+            ConsensusError::TimeOutMessage(mdone.height, mdone.round)
+        );
+
+        if self.parameters.exp == 1 {
+            mdone.verify(&self.committee, &self.pk_set)?;
+        }
+
+        let d_flag = self
+            .smvba_d_flag
+            .entry((mdone.height, mdone.round))
+            .or_insert(false);
+
+        let set = self
+            .smvba_dones
+            .entry((mdone.height, mdone.round))
+            .or_insert(HashSet::new());
+        set.insert(mdone.author);
+        let weight = set.len() as Stake;
+
+        // d_flag= false and weight == f+1?
+        if *d_flag == false && weight == self.committee.random_coin_threshold() {
+            *d_flag = true;
+            // set.insert(self.name);
+            // weight += 1;
+            self.invoke_done_and_share(mdone.height, mdone.round)
+                .await?;
+            return Ok(());
+        }
+
+        // 2f+1?
+        if weight == self.committee.quorum_threshold() {
+            //abandon spb message
+            self.spb_abandon_flag.insert(mdone.height, true);
+        }
+
+        Ok(())
+    }
+
     async fn handle_smvba_rs(&mut self, share: &RandomnessShare) -> ConsensusResult<()> {
         debug!("Processing  {:?}", share);
 
@@ -1219,6 +1231,7 @@ impl Core {
             .aggregator
             .add_smvba_random(share.clone(), &self.pk_set)?
         {
+            debug!("Coin Leader {:?}", coin);
             self.leader_elector.add_random_coin(coin.clone());
 
             let leader = coin.leader;
@@ -1316,6 +1329,11 @@ impl Core {
             self.smvba_msg_filter(halt.epoch, halt.height, halt.round, FIN_PHASE),
             ConsensusError::TimeOutMessage(halt.height, halt.round)
         );
+
+        if self.parameters.exp == 1 {
+            halt.verify(&self.committee, &self.pk_set)?;
+        }
+
         if self.leader_elector.get_coin_leader(halt.height, halt.round)
             != Some(halt.value.block.author)
         // leader 是否与 finish value的proposer 相符
@@ -1323,25 +1341,12 @@ impl Core {
             return Ok(());
         }
 
-        if halt.author == self.name {
-            self.smvba_halt_falg.insert(halt.height, true);
+        // halt?
+        if *self.smvba_halt_falg.entry(halt.height).or_insert(false) {
+            return Ok(());
         }
 
-        if self.parameters.exp == 1 {
-            halt.verify(&self.committee, &self.pk_set)?;
-        }
-
-        // if !self
-        //     .mempool_driver
-        //     .verify(halt.value.block.clone(), PES)
-        //     .await?
-        // {
-        //     debug!(
-        //         "Processing of {} suspended: missing payload",
-        //         halt.value.block.digest()
-        //     );
-        //     return Ok(());
-        // }
+        self.smvba_halt_falg.insert(halt.height, true);
 
         self.handle_smvba_out(halt.height, &halt.value, &halt.proof)
             .await?;
@@ -1364,14 +1369,16 @@ impl Core {
             //stop vote to height+1
         } else if value.val == PES {
             //commit PES: h-1 ,h OPT: [:h-2]
-            let last_block = self
-                .smvba_halt_values
-                .get(&(height - 1))
-                .expect("not found last halt phase value");
-
             let mut current_block = value.block.clone();
             current_block.qc = QC::genesis();
-            current_block.qc.hash = last_block.digest();
+            if self.smvba_halt_values.contains_key(&(height - 1)) {
+                let last_block = self
+                    .smvba_halt_values
+                    .get(&(height - 1))
+                    .expect("not found last halt phase value");
+
+                current_block.qc.hash = last_block.digest();
+            }
 
             self.process_par_out(&current_block).await?;
         }
@@ -1451,13 +1458,13 @@ impl Core {
                 .await;
             self.broadcast_opt_propose(block)
                 .await
-                .expect("Failed to send the OPT block");
+                .expect("Failed to send the first OPT block");
         }
 
-        if self.pes_path {
+        if self.pes_path && !self.opt_path {
             self.invoke_smvba(self.height, OPT, Vec::new(), None)
                 .await
-                .expect("Failed to send the PES block");
+                .expect("Failed to send the first PES block");
         }
 
         // This is the main loop: it processes incoming blocks and votes,

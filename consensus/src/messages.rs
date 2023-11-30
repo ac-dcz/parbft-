@@ -191,7 +191,12 @@ pub enum PrePareProof {
 impl PrePareProof {
     pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
         match self {
-            Self::OPTProof(qc) => qc.verify(committee),
+            Self::OPTProof(qc) => {
+                if *qc != QC::genesis() {
+                    qc.verify(committee)?;
+                }
+                Ok(())
+            }
             Self::PESProof(proof) => {
                 ensure!(proof.phase == FIN_PHASE, ConsensusError::InvalidFinProof());
                 proof.verify(committee)
@@ -263,8 +268,8 @@ impl fmt::Debug for PrePare {
         }
         write!(
             f,
-            "PrePare(tag {}, height {}, author {})",
-            tag, self.height, self.author
+            "PrePare(tag {}, epoch {},height {}, author {})",
+            tag, self.epoch, self.height, self.author
         )
     }
 }
@@ -309,11 +314,11 @@ impl SPBValue {
         } else if self.val == PES && weight < committee.quorum_threshold() {
             flag = false;
         }
-        if flag {
+        if flag && self.block.height != 1 {
             // Check the signatures.
             Signature::verify_batch(&SPBValue::aba_val_digest(self.val), &self.signatures)
                 .map_err(ConsensusError::from)?;
-        } else {
+        } else if self.block.height != 1 {
             return Err(ConsensusError::InvalidPrePareTag(self.val));
         }
 
@@ -339,8 +344,8 @@ impl fmt::Debug for SPBValue {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
-            "SPBValue(proposer {}, round {}, pahse {})",
-            self.block.author, self.round, self.phase
+            "SPBValue(proposer {}, epoch {}, height {} ,round {}, pahse {})",
+            self.block.author, self.block.epoch, self.block.height, self.round, self.phase
         )
     }
 }
@@ -457,7 +462,7 @@ impl fmt::Debug for SPBProof {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
-            "SPBProof(height {} ,round {}, phase {} authot)",
+            "SPBProof(height {} ,round {}, phase {})",
             self.height, self.round, self.phase
         )
     }
@@ -649,8 +654,8 @@ impl fmt::Debug for MPreVote {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "PreVote(author {}, leader {}, round {}, tag {},)",
-            self.author, self.leader, self.round, self.tag
+            "PreVote(author {}, leader {},epoch {}, height {},round {}, tag {},)",
+            self.author, self.leader, self.epoch, self.height, self.round, self.tag
         )
     }
 }
@@ -780,8 +785,8 @@ impl fmt::Debug for MVote {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "MVote(author {}, leader {}, round {}, tag {},)",
-            self.author, self.leader, self.round, self.tag
+            "MVote(author {}, leader {},epoch {}, height {}, round {}, tag {},)",
+            self.author, self.leader, self.epoch, self.height, self.round, self.tag
         )
     }
 }
@@ -857,8 +862,8 @@ impl fmt::Debug for MHalt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "MHalt(author {}, round {}, leader {},)",
-            self.author, self.round, self.leader
+            "MHalt(author {},epoch {}, height {} ,round {}, leader {},)",
+            self.author, self.epoch, self.height, self.round, self.leader
         )
     }
 }
