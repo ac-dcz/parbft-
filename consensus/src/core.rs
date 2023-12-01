@@ -321,7 +321,7 @@ impl Core {
 
     #[async_recursion]
     async fn handle_opt_vote(&mut self, vote: &HVote) -> ConsensusResult<()> {
-        info!("Processing OPT Vote {:?}", vote);
+        debug!("Processing OPT Vote {:?}", vote);
 
         if vote.height < self.height || self.epoch != vote.epoch {
             return Ok(());
