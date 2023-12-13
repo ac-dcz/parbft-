@@ -53,6 +53,7 @@ impl Filter {
                 sleep(Duration::from_millis(parameters.network_delay)).await;
             }
         }
+
         input
     }
 }
