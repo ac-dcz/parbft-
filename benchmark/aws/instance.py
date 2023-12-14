@@ -16,8 +16,8 @@ class AWSError(Exception):
 
 
 class InstanceManager:
-    INSTANCE_NAME = 'parbft1-node'
-    SECURITY_GROUP_NAME = 'parbft1'
+    INSTANCE_NAME = 'parbft++-node'
+    SECURITY_GROUP_NAME = 'parbft++'
 
     def __init__(self, settings):
         assert isinstance(settings, Settings)
@@ -68,7 +68,7 @@ class InstanceManager:
 
     def _create_security_group(self, client):
         client.create_security_group(
-            Description='ParBFT1 node',
+            Description='ParBFT++ node',
             GroupName=self.SECURITY_GROUP_NAME,
         )
 
