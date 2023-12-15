@@ -13,17 +13,17 @@ def local(ctx):
     ''' Run benchmarks on localhost '''
     bench_params = {
         'nodes': 4,
-        'rate': 1_000,
-        'tx_size': 512,
+        'rate': 40_000,
+        'tx_size': 16,
         'faults': 0,
-        'duration': 20,
+        'duration': 40,
     }
     node_params = {
         'consensus': {
             'timeout_delay': 1_000,
             'sync_retry_delay': 10_000,
-            'max_payload_size': 500,
-            'min_block_delay': 0,
+            'max_payload_size': 1_000,
+            'min_block_delay': 100,
             'network_delay': 1_000, # message delay on the leaders' proposals during DDoS
             'ddos': False, # True for DDoS attack on the leader, False otherwise
             'random_ddos': False,
@@ -31,10 +31,10 @@ def local(ctx):
             'exp': 0 # multiplicative factor for exponential fallback
         },
         'mempool': {
-            'queue_capacity': 10_000,
-            'sync_retry_delay': 100_000,
-            'max_payload_size': 15_000,
-            'min_block_delay': 0
+            'queue_capacity': 100_000,
+            'sync_retry_delay': 10_000,
+            'max_payload_size': 15_625,
+            'min_block_delay': 100
         },
         'protocol': 1, # 0 for 2-chain HotStuff, 1 for ParBFT, 2 for SMVBA
     }
@@ -46,7 +46,7 @@ def local(ctx):
 
 
 @task
-def create(ctx, nodes=1): # 创建机器实例  nodes表示在一台机器上跑多少个节点
+def create(ctx, nodes=4): # 创建机器实例  nodes表示在一台机器上跑多少个节点
     ''' Create a testbed'''
     try:
         InstanceManager.make().create_instances(nodes)
@@ -104,10 +104,10 @@ def remote(ctx):
     ''' Run benchmarks on AWS '''
     bench_params = {
         'nodes': [16],
-        'rate': [20_000,40_000],
+        'rate': [30_000,90_000],
         'tx_size': 16,
         'faults': 0, 
-        'duration': 120,
+        'duration': 60,
         'runs': 1,
     }
     node_params = {
@@ -120,7 +120,7 @@ def remote(ctx):
             'ddos': False, # True for DDoS attack on the leader, False otherwise
             'random_ddos': False,
             'random_ddos_chance': 5,
-            'exp': 5 # multiplicative factor for exponential fallback
+            'exp': 0 # multiplicative factor for exponential fallback
         },
         'mempool': {
             'queue_capacity': 100_000,

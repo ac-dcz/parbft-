@@ -11,13 +11,13 @@
     },
     "repo": {
         "name": "parbft-bvaba",
-        "url": "https://github.com/ac-dcz/parbft-bvaba",
+        "url": "https://github.com/ac-dcz/parbft_bvaba",
         "branch": "main"
     },
     "instances": {
         "type": "m5d.xlarge",
         "regions": [
-            "us-east-1",
+            "us-east-2",
             "eu-north-1",
             "ap-northeast-1",
             "ap-southeast-2"
