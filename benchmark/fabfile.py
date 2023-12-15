@@ -16,10 +16,11 @@ def local(ctx):
         'rate': 40_000,
         'tx_size': 16,
         'faults': 0,
-        'duration': 40,
+        'duration': 20,
     }
     node_params = {
         'consensus': {
+            'node_sync_time': 500,
             'timeout_delay': 1_000,
             'sync_retry_delay': 10_000,
             'max_payload_size': 1_000,
@@ -104,7 +105,7 @@ def remote(ctx):
     ''' Run benchmarks on AWS '''
     bench_params = {
         'nodes': [16],
-        'rate': [30_000,110_000,120_000],
+        'rate': [120_000,110_000,30_000],
         'tx_size': 16,
         'faults': 0, 
         'duration': 60,
@@ -112,6 +113,7 @@ def remote(ctx):
     }
     node_params = {
         'consensus': {
+            'node_sync_time': 500,
             'timeout_delay': 60_000,
             'sync_retry_delay': 100_000,
             'max_payload_size': 1_000,
