@@ -12,6 +12,7 @@ use log::{error, warn};
 use network::NetMessage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+// use std::collections::VecDeque;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use store::Store;
@@ -204,6 +205,12 @@ impl Core {
             }
         } else if tag == OPT {
             let digest_len = Digest::default().size();
+            // let mut num = max / digest_len;
+            // let mut digests = vec![];
+            // while num > 0 && self.opt_queue.len() > 0 {
+            //     digests.push(self.opt_queue.pop_back().unwrap());
+            //     num = num - 1;
+            // }
             let digests = self
                 .opt_queue
                 .iter()
@@ -225,6 +232,7 @@ impl Core {
             for x in &digests {
                 self.pes_queue.remove(x); //去重
             }
+
             Ok(digests)
         }
     }
@@ -237,6 +245,7 @@ impl Core {
         self.synchronizer.cleanup(round).await;
         for x in &digests {
             self.opt_queue.remove(x);
+            self.pes_queue.remove(x);
         }
     }
 
