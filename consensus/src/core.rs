@@ -213,6 +213,7 @@ impl Core {
         self.smvba_no_prevotes
             .insert((height, round), HashSet::new());
         self.smvba_votes.insert((height, round), HashSet::new());
+        self.spb_abandon_flag.remove(&height);
     }
 
     fn update_prepare_state(&mut self, height: SeqNumber) {
@@ -238,6 +239,7 @@ impl Core {
         self.par_prepare_opts.retain(|h, _| h > height);
         self.par_prepare_pess.retain(|h, _| h > height);
         self.smvba_halt_values.retain(|h, _| h > height);
+        self.spb_abandon_flag.retain(|h, _| h > height);
     }
 
     async fn store_block(&mut self, block: &Block) {

@@ -339,9 +339,10 @@ class Bench:
                         self._run_single(
                             hosts, r, bench_parameters, node_parameters, debug
                         )
-                        self._logs(hosts, faults, protocol, ddos).print(PathMaker.result_file(
-                            n, r, bench_parameters.tx_size, faults
-                        ))
+                        self._logs(hosts, faults, protocol, ddos).print(
+                            PathMaker.result_file(n, r, bench_parameters.tx_size, faults),
+                            PathMaker.txs_file(n, r, bench_parameters.tx_size, faults)
+                        )
                     except (subprocess.SubprocessError, GroupException, ParseError) as e:
                         self.kill(hosts=hosts)
                         if isinstance(e, GroupException):
