@@ -140,6 +140,8 @@ async fn generate_proposal() {
     let qc = QC {
         hash,
         epoch: 0,
+        round: 0,
+        tag: OPT,
         height: block.height,
         proposer: block.author,
         acceptor: block.author,

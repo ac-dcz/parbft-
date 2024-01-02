@@ -7,7 +7,7 @@ use ed25519_dalek::Sha512;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::convert::TryInto;
-use std::fmt::{self, Debug};
+use std::fmt::{self};
 use threshold_crypto::{PublicKeySet, SignatureShare};
 
 #[cfg(test)]
@@ -23,7 +23,8 @@ pub struct Block {
     pub epoch: SeqNumber,
     pub payload: Vec<Digest>,
     pub signature: Signature,
-    pub tag: u8,
+    pub tag: u8,          //fallback
+    pub round: SeqNumber, // fallback
 }
 
 impl Block {
@@ -32,6 +33,7 @@ impl Block {
         author: PublicKey,
         height: SeqNumber,
         epoch: SeqNumber,
+        round: SeqNumber,
         payload: Vec<Digest>,
         mut signature_service: SignatureService,
         tag: u8,
@@ -40,6 +42,7 @@ impl Block {
             qc,
             author,
             height,
+            round,
             epoch,
             payload,
             signature: Signature::default(),
@@ -89,6 +92,7 @@ impl Hash for Block {
         }
         hasher.update(&self.qc.hash);
         hasher.update(self.tag.to_le_bytes());
+        hasher.update(self.round.to_le_bytes());
         Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
     }
 }
@@ -118,8 +122,10 @@ impl fmt::Display for Block {
 pub struct HVote {
     pub hash: Digest,
     pub height: SeqNumber,
+    pub round: SeqNumber,
     pub epoch: SeqNumber,
     pub proposer: PublicKey, // proposer of the block
+    pub tag: u8,
     pub author: PublicKey,
     pub signature: Signature,
 }
@@ -128,6 +134,8 @@ impl HVote {
     pub async fn new(
         block: &Block,
         author: PublicKey,
+        round: SeqNumber,
+        tag: u8,
         mut signature_service: SignatureService,
     ) -> Self {
         let vote = Self {
@@ -136,6 +144,8 @@ impl HVote {
             epoch: block.epoch,
             proposer: block.author,
             author,
+            round,
+            tag,
             signature: Signature::default(),
         };
         let signature = signature_service.request_signature(vote.digest()).await;
@@ -160,6 +170,8 @@ impl Hash for HVote {
         let mut hasher = Sha512::new();
         hasher.update(&self.hash);
         hasher.update(self.height.to_le_bytes());
+        hasher.update(self.round.to_le_bytes());
+        hasher.update(self.tag.to_le_bytes());
         hasher.update(self.epoch.to_le_bytes());
         hasher.update(self.proposer.0);
         Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
@@ -182,28 +194,28 @@ impl fmt::Display for HVote {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
-pub enum PrePareProof {
-    OPTProof(QC),
-    PESProof(SPBProof),
-}
+// #[derive(Clone, Serialize, Deserialize, Debug)]
+// pub enum PrePareProof {
+//     OPTProof(QC),
+//     PESProof(SPBProof),
+// }
 
-impl PrePareProof {
-    pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
-        match self {
-            Self::OPTProof(qc) => {
-                if *qc != QC::genesis() {
-                    qc.verify(committee)?;
-                }
-                Ok(())
-            }
-            Self::PESProof(proof) => {
-                ensure!(proof.phase == FIN_PHASE, ConsensusError::InvalidFinProof());
-                proof.verify(committee)
-            }
-        }
-    }
-}
+// impl PrePareProof {
+//     pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
+//         match self {
+//             Self::OPTProof(qc) => {
+//                 if *qc != QC::genesis() {
+//                     qc.verify(committee)?;
+//                 }
+//                 Ok(())
+//             }
+//             Self::PESProof(proof) => {
+//                 ensure!(proof.phase == FIN_PHASE, ConsensusError::InvalidFinProof());
+//                 proof.verify(committee)
+//             }
+//         }
+//     }
+// }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PrePare {
@@ -211,7 +223,7 @@ pub struct PrePare {
     pub epoch: SeqNumber,
     pub height: SeqNumber,
     pub val: u8,
-    pub proof: PrePareProof,
+    pub qc: QC,
     pub signature: Signature,
 }
 
@@ -220,7 +232,7 @@ impl PrePare {
         author: PublicKey,
         epoch: SeqNumber,
         height: SeqNumber,
-        proof: PrePareProof,
+        qc: QC,
         val: u8,
         mut signature_service: SignatureService,
     ) -> Self {
@@ -229,7 +241,7 @@ impl PrePare {
             epoch,
             height,
             val,
-            proof,
+            qc,
             signature: Signature::default(),
         };
 
@@ -238,7 +250,7 @@ impl PrePare {
         return prepare;
     }
 
-    pub fn verify(&self, committee: &Committee) -> ConsensusResult<()> {
+    pub fn verify(&self, committee: &Committee, fallback_length: SeqNumber) -> ConsensusResult<()> {
         ensure!(
             self.val == OPT || self.val == PES,
             ConsensusError::InvalidPrePareTag(self.val)
@@ -246,7 +258,12 @@ impl PrePare {
 
         self.signature.verify(&self.digest(), &self.author)?;
 
-        self.proof.verify(committee)
+        self.qc.verify(committee)?;
+
+        if self.qc.round != fallback_length {
+            return Err(ConsensusError::InvalidPreParePESQC(self.qc.round));
+        }
+        Ok(())
     }
 }
 
@@ -873,6 +890,8 @@ pub struct QC {
     pub hash: Digest,
     pub height: SeqNumber,
     pub epoch: SeqNumber,
+    pub round: SeqNumber,
+    pub tag: u8,
     pub proposer: PublicKey, // proposer of the block
     pub acceptor: PublicKey, // Node that accepts the QC and builds its f-chain extending it
     pub votes: Vec<(PublicKey, Signature)>,
@@ -918,6 +937,8 @@ impl Hash for QC {
         hasher.update(self.height.to_le_bytes());
         hasher.update(self.epoch.to_le_bytes());
         hasher.update(self.proposer.0);
+        hasher.update(self.tag.to_le_bytes());
+        hasher.update(self.round.to_le_bytes());
         Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
     }
 }

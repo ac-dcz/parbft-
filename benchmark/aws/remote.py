@@ -317,7 +317,7 @@ class Bench:
                 Print.heading(f'\nRunning {n} nodes (input rate: {r:,} tx/s)')
                 hosts = selected_hosts[:n]
 
-                # # Upload all configuration files.
+                # Upload all configuration files.
                 # try:
                 #     self._config(hosts, node_parameters)
                 # except (subprocess.SubprocessError, GroupException) as e:

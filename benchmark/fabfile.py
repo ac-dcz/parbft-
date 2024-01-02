@@ -16,7 +16,7 @@ def local(ctx):
         'rate': 40_000,
         'tx_size': 16,
         'faults': 0,
-        'duration': 20,
+        'duration': 40,
     }
     node_params = {
         'consensus': {
@@ -25,10 +25,11 @@ def local(ctx):
             'sync_retry_delay': 10_000,
             'max_payload_size': 1_000,
             'min_block_delay': 100,
-            'network_delay': 1_000, # message delay on the leaders' proposals during DDoS
-            'ddos': False, # True for DDoS attack on the leader, False otherwise
+            'network_delay': 10_000, # message delay on the leaders' proposals during DDoS
+            'ddos': True, # True for DDoS attack on the leader, False otherwise
             'random_ddos': False,
             'random_ddos_chance': 5,
+            'fallback_length': 3,
             'exp': 0 # multiplicative factor for exponential fallback
         },
         'mempool': {
@@ -105,11 +106,11 @@ def remote(ctx):
     ''' Run benchmarks on AWS '''
     bench_params = {
         'nodes': [16],
-        'rate': [200_000,120_000,90_000],
+        'rate': [60_000,70_000,80_000],
         'tx_size': 16,
         'faults': 0, 
         'duration': 60,
-        'runs': 2,
+        'runs': 1,
     }
     node_params = {
         'consensus': {
@@ -120,8 +121,9 @@ def remote(ctx):
             'min_block_delay': 100,
             'network_delay': 20_000, # message delay on the leaders' proposals during DDoS
             'ddos': False, # True for DDoS attack on the leader, False otherwise
-            'random_ddos': False,
-            'random_ddos_chance': 5,
+            'random_ddos': True,
+            'random_ddos_chance': 20,
+            'fallback_length': 3,
             'exp': 0 # multiplicative factor for exponential fallback
         },
         'mempool': {
@@ -166,6 +168,6 @@ def kill(ctx):
 def logs(ctx):
     ''' Print a summary of the logs '''
     try:
-        print(LogParser.process('./logs').result())
+        LogParser.process('./logs').print("./results/temp_result.txt","./results/temp_txs.txt")
     except ParseError as e:
         Print.error(BenchError('Failed to parse logs', e))

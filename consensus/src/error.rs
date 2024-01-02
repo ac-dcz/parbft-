@@ -55,6 +55,9 @@ pub enum ConsensusError {
     #[error("Invalid prepare tag {0}")]
     InvalidPrePareTag(u8),
 
+    #[error("Invalid prepare pes QC round {0}")]
+    InvalidPreParePESQC(SeqNumber),
+
     #[error("timeout smvba message height {0},round {1}")]
     TimeOutMessage(SeqNumber, SeqNumber),
 
