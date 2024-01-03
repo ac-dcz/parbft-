@@ -283,6 +283,10 @@ impl Core {
         Ok(())
     }
 
+    fn is_optmistic(&self) -> bool {
+        return !self.parameters.ddos && !self.parameters.random_ddos;
+    }
+
     #[async_recursion]
     async fn generate_proposal(
         &mut self,
@@ -482,18 +486,23 @@ impl Core {
         // Store the block only if we have already processed all its ancestors.
         self.store_block(block).await;
 
+        //again
+        if self.pes_path && block.height > 2 {
+            self.terminate_smvba(self.height - 2)?;
+        }
+
         //TODO:
         // 1. 对 height -1 的 block 发送 prepare-opt
-        if self.pes_path && b1.height >= 1 {
+        if self.pes_path && block.height > 1 {
             self.active_prepare_pahse(
-                b1.height,
-                b1.qc.clone(), //qc h-1
+                block.height - 1,
+                block.qc.clone(), //qc h-1
                 OPT,
             )
             .await?;
         }
-        //2. 启动当前高度的fallback
-        if self.pes_path && block.height > 1 {
+        //2. 在完全乐观情况下 延迟启动
+        if self.is_optmistic() && self.pes_path {
             self.invoke_fallback(block.height, Some(block.qc.clone()))
                 .await?;
         }
@@ -530,19 +539,32 @@ impl Core {
         // See if we can vote for this block.
         if let Some(vote) = self.make_opt_vote(block).await {
             debug!("Created hs {:?}", vote);
-            let leader = self.leader_elector.get_leader(self.height + 1);
-            if leader != self.name {
-                let message = ConsensusMessage::HSVote(vote.clone());
+            let message = ConsensusMessage::HSVote(vote.clone());
+            if self.is_optmistic() {
+                let leader = self.leader_elector.get_leader(self.height + 1);
+                if leader != self.name {
+                    Synchronizer::transmit(
+                        message,
+                        &self.name,
+                        Some(&leader),
+                        &self.network_filter,
+                        &self.committee,
+                        OPT,
+                    )
+                    .await?;
+                } else {
+                    self.handle_opt_vote(&vote).await?;
+                }
+            } else {
                 Synchronizer::transmit(
                     message,
                     &self.name,
-                    Some(&leader),
+                    None,
                     &self.network_filter,
                     &self.committee,
                     OPT,
                 )
                 .await?;
-            } else {
                 self.handle_opt_vote(&vote).await?;
             }
         }
@@ -569,7 +591,7 @@ impl Core {
     async fn handle_opt_vote(&mut self, vote: &HVote) -> ConsensusResult<()> {
         debug!("Processing OPT Vote {:?}", vote);
 
-        if vote.height < self.height || self.epoch != vote.epoch {
+        if vote.height < self.height || self.epoch > vote.epoch {
             return Ok(());
         }
 
@@ -589,6 +611,10 @@ impl Core {
                     .generate_proposal(self.height, 0, Some(self.high_qc.clone()), OPT)
                     .await;
                 self.broadcast_opt_propose(block).await?;
+            }
+            if self.pes_path && !self.is_optmistic() {
+                self.invoke_fallback(self.height, Some(self.high_qc.clone()))
+                    .await?;
             }
         }
         Ok(())
@@ -775,7 +801,7 @@ impl Core {
     }
 
     async fn handle_par_prepare(&mut self, prepare: PrePare) -> ConsensusResult<()> {
-        info!("Processing {:?}", prepare);
+        debug!("Processing {:?}", prepare);
         ensure!(
             prepare.epoch == self.epoch && prepare.height + 2 > self.height,
             ConsensusError::TimeOutMessage(prepare.epoch, prepare.height)
@@ -885,8 +911,8 @@ impl Core {
             shares: Vec::new(),
         };
 
-        if self.spb_proposes.contains_key(&(height, round - 1)) {
-            let last_value = self.spb_proposes.get(&(height, round - 1)).unwrap().clone();
+        if self.spb_proposes.contains_key(&(height, 1)) {
+            let last_value = self.spb_proposes.get(&(height, 1)).unwrap().clone();
 
             let block = self
                 .generate_proposal(
@@ -928,14 +954,22 @@ impl Core {
             return Ok(());
         }
         self.smvba_is_invoke.insert(height, true);
-        let block = self
-            .generate_proposal(height, self.fallback_length + 1, qc, PES)
-            .await;
+        let block;
+        if val == OPT {
+            block = Block::default();
+        } else {
+            block = self
+                .generate_proposal(height, self.fallback_length + 1, qc, PES)
+                .await;
+        }
+        // let block = self
+        //     .generate_proposal(height, self.fallback_length + 1, qc, PES)
+        //     .await;
         let round = self.smvba_current_round.entry(height).or_insert(1).clone();
         let value = SPBValue::new(block, round, INIT_PHASE, val, signatures);
         let proof = SPBProof {
             phase: INIT_PHASE,
-            round: 1,
+            round,
             height,
             shares: Vec::new(),
         };
@@ -1569,7 +1603,7 @@ impl Core {
     }
 
     async fn process_par_out(&mut self, block: &Block) -> ConsensusResult<()> {
-        if self.epoch != block.epoch || self.height >= block.height + 2 {
+        if self.epoch > block.epoch || self.height >= block.height + 2 {
             return Ok(());
         }
 
@@ -1622,6 +1656,11 @@ impl Core {
                                     panic!("Failed to send last epoch message: {}", e);
                                 }
                             }
+                            ConsensusMessage::FBPropose(..) => {
+                                if let Err(e) = self.tx_smvba.send(msg).await {
+                                    panic!("Failed to send last epoch message: {}", e);
+                                }
+                            }
                             _ => break,
                         }
                     }
@@ -1644,7 +1683,7 @@ impl Core {
                 .expect("Failed to send the first OPT block");
         }
 
-        if self.pes_path {
+        if !self.opt_path || (self.pes_path && !self.is_optmistic()) {
             // self.invoke_smvba(self.height, OPT, Vec::new(), None)
             //     .await
             //     .expect("Failed to send the first PES block");

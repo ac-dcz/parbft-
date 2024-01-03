@@ -1,7 +1,7 @@
 {
     "key": {
-        "name": "dcz",
-        "path": "/home/yucz/.ssh/id_rsa"
+        "name": "docker-dcz",
+        "path": "/root/.ssh/id_rsa"
     },
     "ports": {
         "smvba": 9000,

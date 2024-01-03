@@ -16,7 +16,7 @@ def local(ctx):
         'rate': 40_000,
         'tx_size': 16,
         'faults': 0,
-        'duration': 40,
+        'duration': 100,
     }
     node_params = {
         'consensus': {
@@ -24,21 +24,21 @@ def local(ctx):
             'timeout_delay': 1_000,
             'sync_retry_delay': 10_000,
             'max_payload_size': 1_000,
-            'min_block_delay': 100,
+            'min_block_delay': 0,
             'network_delay': 10_000, # message delay on the leaders' proposals during DDoS
-            'ddos': True, # True for DDoS attack on the leader, False otherwise
+            'ddos': False, # True for DDoS attack on the leader, False otherwise
             'random_ddos': False,
-            'random_ddos_chance': 5,
-            'fallback_length': 3,
+            'random_ddos_chance': 10,
+            'fallback_length': 2,
             'exp': 0 # multiplicative factor for exponential fallback
         },
         'mempool': {
             'queue_capacity': 100_000,
             'sync_retry_delay': 10_000,
             'max_payload_size': 15_625,
-            'min_block_delay': 100
+            'min_block_delay': 0
         },
-        'protocol': 1, # 0 for 2-chain HotStuff, 1 for ParBFT, 2 for SMVBA
+        'protocol': 2, # 0 for 2-chain HotStuff, 1 for ParBFT, 2 for SMVBA
     }
     try:
         ret = LocalBench(bench_params, node_params).run(debug=False).result()
@@ -106,11 +106,11 @@ def remote(ctx):
     ''' Run benchmarks on AWS '''
     bench_params = {
         'nodes': [16],
-        'rate': [60_000,70_000,80_000],
+        'rate': [130_000,60_000,80_000,100_000],
         'tx_size': 16,
         'faults': 0, 
         'duration': 60,
-        'runs': 1,
+        'runs': 2,
     }
     node_params = {
         'consensus': {
@@ -122,8 +122,8 @@ def remote(ctx):
             'network_delay': 20_000, # message delay on the leaders' proposals during DDoS
             'ddos': False, # True for DDoS attack on the leader, False otherwise
             'random_ddos': True,
-            'random_ddos_chance': 20,
-            'fallback_length': 3,
+            'random_ddos_chance': 10,
+            'fallback_length': 2,
             'exp': 0 # multiplicative factor for exponential fallback
         },
         'mempool': {
