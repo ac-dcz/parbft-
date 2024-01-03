@@ -2,8 +2,8 @@ use crate::config::Committee;
 use crate::core::MempoolMessage;
 use crate::error::{MempoolError, MempoolResult};
 use bytes::Bytes;
-use consensus::OPT;
 use consensus::{Block, ConsensusMessage, SeqNumber};
+use consensus::{OPT, PES};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use futures::future::try_join_all;
@@ -118,8 +118,13 @@ impl Synchronizer {
                                     if let Err(e) = consensus_channel.send(message).await {
                                         panic!("Failed to send message to consensus: {}", e);
                                     }
-                                }else{
+                                }else if tag == PES{
                                     let message = ConsensusMessage::ParLoopBack(block);
+                                    if let Err(e) = consensus_channel_smvba.send(message).await {
+                                        panic!("Failed to send message to consensus: {}", e);
+                                    }
+                                }else{
+                                    let message = ConsensusMessage::FBLoopBack(block);
                                     if let Err(e) = consensus_channel_smvba.send(message).await {
                                         panic!("Failed to send message to consensus: {}", e);
                                     }
